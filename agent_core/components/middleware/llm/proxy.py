@@ -6,6 +6,7 @@ import itertools
 import logging
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 from agent_core.components.middleware.llm.base import (
@@ -193,40 +194,50 @@ class LLMProxy:
                 full_reasoning = ""
                 stream_error = None
                 any_chunk_yielded = False
+                inner_stream = self.inner.stream(
+                    messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra_headers=extra_headers,
+                    timeout=timeout,
+                )
                 try:
-                    async for delta in self.inner.stream(
-                        messages,
-                        tools=tools,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        extra_headers=extra_headers,
-                        timeout=timeout,
-                    ):
-                        full_content += delta.content or ""
-                        full_reasoning += delta.reasoning_content or ""
-                        any_chunk_yielded = True
-                        # Per-chunk middleware hook. A middleware returning
-                        # True (e.g. StreamRepetitionDetector noticing a
-                        # degenerate loop) tells us to stop consuming the
-                        # inner stream and exit cleanly — the partial
-                        # response still flows through ``after_llm`` in the
-                        # finally block so observers see the truncated
-                        # content rather than nothing. The delta that
-                        # triggered the abort IS still yielded so the
-                        # consumer's accumulator stays consistent with the
-                        # LLMResponse we'll synthesise.
-                        yield delta
-                        if await self.chain.run_on_chunk(
-                            ctx,
-                            delta,
-                            full_content,
-                        ):
-                            ctx.metadata["stream_aborted_by_middleware"] = True
-                            logger.info(
-                                "LLMProxy: stream aborted by middleware after %d chars",
-                                len(full_content),
-                            )
-                            break
+                    try:
+                        async for delta in inner_stream:
+                            full_content += delta.content or ""
+                            full_reasoning += delta.reasoning_content or ""
+                            any_chunk_yielded = True
+                            # Per-chunk middleware hook. A middleware returning
+                            # True (e.g. StreamRepetitionDetector noticing a
+                            # degenerate loop) tells us to stop consuming the
+                            # inner stream and exit cleanly — the partial
+                            # response still flows through ``after_llm`` in the
+                            # finally block so observers see the truncated
+                            # content rather than nothing. The delta that
+                            # triggered the abort IS still yielded so the
+                            # consumer's accumulator stays consistent with the
+                            # LLMResponse we'll synthesise.
+                            yield delta
+                            if await self.chain.run_on_chunk(
+                                ctx,
+                                delta,
+                                full_content,
+                            ):
+                                ctx.metadata["stream_aborted_by_middleware"] = True
+                                logger.info(
+                                    "LLMProxy: stream aborted by middleware after %d chars",
+                                    len(full_content),
+                                )
+                                break
+                    finally:
+                        # ``break`` and a cancelled consumer both leave the
+                        # inner async generator suspended; without an explicit
+                        # close its provider connection stays open until GC.
+                        close = getattr(inner_stream, "aclose", None)
+                        if close is not None:
+                            with suppress(Exception):
+                                await close()
                     break
                 except Exception as e:
                     stream_error = e
