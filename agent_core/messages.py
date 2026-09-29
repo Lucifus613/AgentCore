@@ -11,7 +11,7 @@ so they round-trip through any compatible endpoint with no translation:
      "reasoning_content"?: str}
 
 A ``Message`` may additionally carry in-process bookkeeping keys that are NOT
-part of that format (``duration_ms`` / ``is_error`` / ``spill_refs``). The wire
+part of that format (``duration_ms`` / ``is_error`` / ``spill_refs`` / ``origin``). The wire
 format is the subset named by :data:`WIRE_MESSAGE_KEYS`, and :func:`for_wire`
 is what enforces the boundary — see the note on each key for why the split is
 not simply "everything OpenAI documents".
@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict, cast
 
 Role = Literal["system", "user", "assistant", "tool"]
+MessageOrigin = Literal["control", "user_steer", "fan_in_evidence"]
 
 
 class ToolCall(TypedDict):
@@ -90,6 +91,10 @@ class Message(TypedDict, total=False):
     # request drops them and appends the real turn in their place, so a prefix
     # ending on one is never reused. Filtered out by ``for_wire``.
     transient: bool
+    # Runtime provenance for observer injections. Session replay uses it to
+    # distinguish disposable control nudges from user steering and fan-in
+    # evidence. It is in-process bookkeeping and ``for_wire`` strips it.
+    origin: MessageOrigin
 
 
 # ── Wire boundary ────────────────────────────────────────────────────────
@@ -164,8 +169,15 @@ def system_msg(content: str) -> Message:
     return {"content": content, "role": "system"}
 
 
-def user_msg(content: str) -> Message:
-    return {"content": content, "role": "user"}
+def user_msg(
+    content: str,
+    *,
+    origin: MessageOrigin | None = None,
+) -> Message:
+    message: Message = {"content": content, "role": "user"}
+    if origin is not None:
+        message["origin"] = origin
+    return message
 
 
 def assistant_msg(
@@ -284,6 +296,7 @@ def is_assistant_msg(m: Message) -> bool:
 __all__ = [
     "WIRE_MESSAGE_KEYS",
     "Message",
+    "MessageOrigin",
     "Role",
     "ToolCall",
     "assistant_msg",

@@ -1,0 +1,1 @@
+Observer injections carry a `MessageOrigin` (`control`, `user_steer`, `fan_in_evidence`) through `InjectedMessage` and `append_injected_messages`; the loop's own continuation and no-tool nudges are marked `control`. Plain-string injections default to `control`.
