@@ -376,7 +376,8 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
     answer: the caller would otherwise execute tool calls from a response the
     server itself reported as failed.
     """
-    if str(_get(raw, "status", "") or "") == "failed":
+    status = str(_get(raw, "status", "") or "")
+    if status == "failed":
         raise _response_failure(raw, fallback="Responses request failed")
     blocks_out: list[dict[str, Any]] = []
     text_parts: list[str] = []
@@ -407,6 +408,10 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
             for part in (_get(item, "content", None) or []):
                 if _get(part, "type", "") == "output_text":
                     txt = _get(part, "text", "") or ""
+                    text_parts.append(txt)
+                    blocks_out.append({"type": "text", "text": txt})
+                elif _get(part, "type", "") == "refusal":
+                    txt = _get(part, "refusal", "") or ""
                     text_parts.append(txt)
                     blocks_out.append({"type": "text", "text": txt})
         elif itype == "function_call":
@@ -441,6 +446,10 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
         blocks_out.append({"type": "text", "text": flat_text})
 
     content: Any = blocks_out if blocks_out else "\n".join(text_parts)
+    metadata: dict[str, Any] = {"id": _get(raw, "id", ""), "status": status}
+    incomplete_reason = _get(_get(raw, "incomplete_details", None) or {}, "reason", "")
+    if incomplete_reason:
+        metadata["incomplete_reason"] = incomplete_reason
     return LLMResponse(
         content=content,
         tool_calls=tool_calls,
@@ -453,7 +462,7 @@ def _parse_responses_output(raw: Any) -> LLMResponse:
         ),
         model=_get(raw, "model", "") or "",
         usage=_responses_usage_dict(_get(raw, "usage", None)),
-        response_metadata={"id": _get(raw, "id", "")},
+        response_metadata=metadata,
     )
 
 

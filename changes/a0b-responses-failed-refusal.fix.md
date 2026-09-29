@@ -1,0 +1,1 @@
+The Responses client raises `LLMError` for a `failed` response instead of returning its partial output as an answer, includes `refusal` parts in the reply text, and reports `status` / `incomplete_reason` in `response_metadata`.
