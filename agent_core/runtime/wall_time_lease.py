@@ -26,7 +26,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -55,11 +56,13 @@ class WallTimeRenewal:
 
 
 class RenewableWallTimeLease:
-    """Thread-safe stream of accepted wall-time renewals.
+    """Thread-safe stream of accepted wall-time renewals, and of pauses.
 
     Each consumer binds its own :class:`RenewableWallTimeDeadline`, so a loop's
     soft duration cannot overwrite another loop or the serve-level hard guard.
-    The lease owns only renewal ordering and timestamps.
+    The lease owns renewal ordering, timestamps, and the spans during which
+    the clock is paused (a person is being asked, see :meth:`paused`): time
+    inside a pause counts against no consumer's window.
     """
 
     def __init__(self) -> None:
@@ -67,6 +70,33 @@ class RenewableWallTimeLease:
         self._sequence = 0
         self._created_monotonic = time.monotonic()
         self._latest_renewal_monotonic: float | None = None
+        self._pause_depth = 0
+        self._pause_started: float | None = None
+        self._pauses: list[tuple[float, float]] = []
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Stop every consumer's clock for the duration; pauses may overlap."""
+        with self._lock:
+            if self._pause_depth == 0:
+                self._pause_started = time.monotonic()
+            self._pause_depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._pause_depth -= 1
+                if self._pause_depth == 0 and self._pause_started is not None:
+                    self._pauses.append((self._pause_started, time.monotonic()))
+                    self._pause_started = None
+
+    def _running_s(self, anchor: float, now: float) -> float:
+        """Seconds between ``anchor`` and ``now`` outside pauses; hold the lock."""
+        spans = list(self._pauses)
+        if self._pause_started is not None:
+            spans.append((self._pause_started, now))
+        paused = sum(max(0.0, min(end, now) - max(start, anchor)) for start, end in spans)
+        return max(0.0, now - anchor - paused)
 
     def renew(self) -> WallTimeRenewal:
         """Start a fresh wall-time window and return its wire description."""
@@ -117,8 +147,8 @@ class RenewableWallTimeLease:
         with self._lock:
             renewal = self._latest_renewal_monotonic
             anchor = max(start, renewal) if renewal is not None else start
-            now = time.monotonic()
-        return max(0.0, float(duration_s)) - (now - anchor)
+            running = self._running_s(anchor, time.monotonic())
+        return max(0.0, float(duration_s)) - running
 
     def elapsed_s(self, *, started_monotonic: float | None = None) -> float:
         """Seconds elapsed in one consumer's current renewable window."""
@@ -130,8 +160,7 @@ class RenewableWallTimeLease:
         with self._lock:
             renewal = self._latest_renewal_monotonic
             anchor = max(start, renewal) if renewal is not None else start
-            now = time.monotonic()
-        return max(0.0, now - anchor)
+            return self._running_s(anchor, time.monotonic())
 
     @property
     def sequence(self) -> int:
