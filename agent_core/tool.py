@@ -8,7 +8,7 @@ import re
 import typing
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Union, get_args, get_origin, overload
+from typing import Any, Literal, Union, get_args, get_origin, overload
 
 ToolFn = Callable[..., Awaitable[Any]]
 
@@ -80,6 +80,18 @@ def _schema_for_type(t: Any) -> dict[str, Any]:
             return model_schema
 
     origin = get_origin(t)
+    if origin is Literal:
+        # Name the legal values: a bare "string" leaves the model guessing and
+        # lets off-list values through to the tool.
+        values = list(get_args(t))
+        kinds = {type(value) for value in values}
+        if len(kinds) == 1 and (kind := kinds.pop()) in _PRIMITIVE_TYPES:
+            return {"type": _PRIMITIVE_TYPES[kind], "enum": values}
+        return {"enum": values}
+    if t is dict or origin is dict:
+        # A bare ``dict`` has no origin and would fall into the string branch
+        # below; both forms are a JSON object.
+        return {"type": "object"}
     if origin is None:
         # Unannotated / unknown, ``Any`` included. Deliberately a concrete
         # ``string`` rather than the permissive ``{}`` a bare ``Any`` would
@@ -96,9 +108,6 @@ def _schema_for_type(t: Any) -> dict[str, Any]:
             return {"type": "array", "items": _schema_for_type(args[0])}
         return {"type": "array"}
 
-    if origin is dict:
-        return {"type": "object"}
-
     if origin in (Union, typing.Union):  # type: ignore[attr-defined]
         non_none = [a for a in get_args(t) if a is not type(None)]
         nullable = len(non_none) != len(get_args(t))
@@ -108,6 +117,11 @@ def _schema_for_type(t: Any) -> dict[str, Any]:
         else:
             schema = {"anyOf": [_schema_for_type(a) for a in non_none]}
         if nullable:
+            if "enum" in schema and None not in schema["enum"]:
+                # A nullable Literal must admit null too, or a validator rejects its own default.
+                schema["enum"] = [*schema["enum"], None]
+                if isinstance(schema.get("type"), str):
+                    schema["type"] = [schema["type"], "null"]
             # ``default: null`` is FastMCP's idiom; many proxies accept it.
             schema.setdefault("default", None)
         return schema
