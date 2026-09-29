@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Literal, Protocol, TypedDict, cast, runtime_checkable
 
-from agent_core.messages import Message
+from agent_core.messages import Message, MessageOrigin
 
 logger = logging.getLogger(__name__)
 
@@ -355,9 +355,31 @@ class ContextCompactionContext:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class InjectedMessage:
+    """One observer injection with replay provenance kept per message."""
+
+    content: str
+    origin: MessageOrigin
+
+
+def append_injected_messages(
+    messages: list[Any],
+    injections: list[str | InjectedMessage] | None,
+) -> None:
+    """Append observer injections with fail-closed replay provenance."""
+    from agent_core.messages import user_msg
+
+    for injection in injections or []:
+        if isinstance(injection, InjectedMessage):
+            messages.append(user_msg(injection.content, origin=injection.origin))
+        else:
+            messages.append(user_msg(injection, origin="control"))
+
+
 @dataclass
 class Intervention:
-    inject_messages: list[str] | None = None
+    inject_messages: list[str | InjectedMessage] | None = None
     stop_reason: str | None = None
     skip_tool_execution: bool = False
     # Applied after message injection and before continuing the turn.
@@ -642,7 +664,7 @@ async def drain_background_observers() -> None:
 
 def merge_interventions(interventions: list[Intervention]) -> Intervention:
     """Merge messages, take the first non-empty stop, and OR boolean controls."""
-    all_messages: list[str] = []
+    all_messages: list[str | InjectedMessage] = []
     inject_messages_set = False
     stop_reason: str | None = None
     skip: bool = False
@@ -740,6 +762,7 @@ __all__ = [
     "CompactionEvent",
     "CompactionObserver",
     "ContextCompactionContext",
+    "InjectedMessage",
     "Intervention",
     "LLMAttemptContext",
     "LLMDeltaContext",
@@ -751,6 +774,7 @@ __all__ = [
     "TurnContext",
     "UsageMetadata",
     "UsageMetadataExtras",
+    "append_injected_messages",
     "deadline_remaining_s",
     "drain_background_observers",
     "merge_interventions",

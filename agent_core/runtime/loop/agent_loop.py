@@ -28,6 +28,7 @@ from agent_core.loop_types import (
     ToolResult,
     TurnContext,
     UsageMetadata,
+    append_injected_messages,
     merge_interventions,
     notify_observers,
     notify_tool_call,
@@ -534,7 +535,9 @@ async def _run_loop_inner(
                 # The partial text is already in history (``_process_llm_response``
                 # appended it), so the work survives and the model is asked to
                 # resume from it rather than restart.
-                messages.append(user_msg(TRUNCATION_CONTINUATION_GUIDANCE))
+                messages.append(
+                    user_msg(TRUNCATION_CONTINUATION_GUIDANCE, origin="control")
+                )
                 # Continuations have their own bounded retry allowance.  Do not
                 # consume the workflow's logical turn budget, especially on the
                 # landing turn where no later turn would otherwise exist.
@@ -576,7 +579,9 @@ async def _run_loop_inner(
             if stops_for_no_tool:
                 stop_reason = "no_tool"
                 break
-            messages.append(user_msg(_build_no_tool_nudge(cfg.loop_policy)))
+            messages.append(
+                user_msg(_build_no_tool_nudge(cfg.loop_policy), origin="control")
+            )
             continue
 
         no_tool_retries = 0
@@ -694,9 +699,7 @@ async def _prepare_llm_request(
     before_llm_interventions = await notify_observers(obs, "on_before_llm", before_llm_ctx)
     merged_before_llm = merge_interventions(before_llm_interventions)
 
-    if merged_before_llm.inject_messages:
-        for msg_text in merged_before_llm.inject_messages:
-            messages.append(user_msg(msg_text))
+    append_injected_messages(messages, merged_before_llm.inject_messages)
 
     messages_for_call = messages
     if cfg.system_addendum_per_call and turn > cfg.system_addendum_min_turn:
@@ -1292,9 +1295,7 @@ async def _process_llm_response(
                 policy="on_llm_response_rollback",
             )
     if merged_llm.continue_to_next_turn:
-        if merged_llm.inject_messages:
-            for msg_text in merged_llm.inject_messages:
-                messages.append(user_msg(msg_text))
+        append_injected_messages(messages, merged_llm.inject_messages)
         # The turn is being replayed without executing its calls. When the
         # observer also popped the assistant message this is a no-op; when it
         # did not, these ids would otherwise reach the next request unanswered.
@@ -1308,9 +1309,7 @@ async def _process_llm_response(
             last_input_tokens, last_output_tokens,
         )
 
-    if merged_llm.inject_messages:
-        for msg_text in merged_llm.inject_messages:
-            messages.append(user_msg(msg_text))
+    append_injected_messages(messages, merged_llm.inject_messages)
 
     if not stop_reason and blocked_landing_calls and not parsed_calls:
         return (
@@ -1484,9 +1483,7 @@ async def _execute_tool_calls(
     if any(result.interrupted for result in results):
         wait_interventions = await notify_observers(obs, "on_tool_wait_interrupted", ctx)
         merged_wait = merge_interventions(wait_interventions)
-        if merged_wait.inject_messages:
-            for msg_text in merged_wait.inject_messages:
-                messages.append(user_msg(msg_text))
+        append_injected_messages(messages, merged_wait.inject_messages)
         if merged_wait.stop_reason:
             return merged_wait.stop_reason, len(parsed_calls)
 
@@ -1632,9 +1629,7 @@ async def _handle_turn_end(
     merged_turn = merge_interventions(turn_interventions)
 
     if merged_turn.stop_reason:
-        if merged_turn.inject_messages:
-            for msg_text in merged_turn.inject_messages:
-                messages.append(user_msg(msg_text))
+        append_injected_messages(messages, merged_turn.inject_messages)
         return merged_turn.stop_reason, False
 
     # End-of-turn rollback runs after tool replies entered history. Remove the
@@ -1656,9 +1651,7 @@ async def _handle_turn_end(
                 metadata=metadata,
                 policy="on_turn_end_rollback",
             )
-    if merged_turn.inject_messages:
-        for msg_text in merged_turn.inject_messages:
-            messages.append(user_msg(msg_text))
+    append_injected_messages(messages, merged_turn.inject_messages)
     if merged_turn.continue_to_next_turn:
         return "", True
 
