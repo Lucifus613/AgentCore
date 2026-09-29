@@ -89,7 +89,13 @@ from agent_core.components.agent_bus.shared_pool import SharedArtifactPool
 from agent_core.components.agent_bus.spawn_guard import SpawnGuard
 from agent_core.components.observers.wall_clock_guard import WallClockGuard
 from agent_core.events import EventType
-from agent_core.loop_types import BaseObserver
+from agent_core.loop_types import (
+    ATTEMPT_DISCARDED,
+    ATTEMPT_FAILED,
+    DELIVERED_ATTEMPT_OUTCOMES,
+    BaseObserver,
+    CallSupersessionTracker,
+)
 from agent_core.messages import (
     Message,
     assistant_msg,
@@ -280,14 +286,26 @@ class _SessionActivityObserver(BaseObserver):
     critical = True
     _DETAIL_LIMIT = 8_000
 
-    def __init__(self, session: SubAgentSession) -> None:
+    def __init__(
+        self,
+        session: SubAgentSession,
+        *,
+        wants_llm_delta: bool = False,
+    ) -> None:
         self.session = session
+        self.wants_llm_delta = wants_llm_delta
         self._sequence = 0
-        self._thinking_by_turn: dict[int, dict[str, Any]] = {}
+        self._llm_events: dict[str, dict[str, dict[str, Any]]] = {}
+        self._current_attempt_by_turn: dict[int, str] = {}
+        self._current_call_by_turn: dict[int, str] = {}
+        self._call_supersession = CallSupersessionTracker()
 
     def _append(
         self, kind: str, title: str, detail: str, *, turn: int = 0,
         is_error: bool = False,
+        attempt_id: str = "",
+        call_id: str = "",
+        draft: bool = False,
     ) -> dict[str, Any]:
         detail = str(detail or "").strip()
         if len(detail) > self._DETAIL_LIMIT:
@@ -300,42 +318,142 @@ class _SessionActivityObserver(BaseObserver):
             "detail": detail,
             "turn": turn,
             "is_error": is_error,
+            "attempt_id": attempt_id,
+            "call_id": call_id,
+            "draft": draft,
             "at": time.monotonic(),
         }
         self.session.activity_events.append(event)
         return event
 
-    async def on_llm_delta(self, ctx: Any) -> None:
-        delta = str(getattr(ctx, "thinking_delta", "") or "")
-        if not delta:
-            return
+    @staticmethod
+    def _attempt_key(ctx: Any) -> str:
+        attempt_id = str(getattr(ctx, "attempt_id", "") or "")
+        if attempt_id:
+            return attempt_id
+        call_id = str(getattr(ctx, "call_id", "") or "llm")
+        index = int(getattr(ctx, "attempt_index", 1) or 1)
+        return f"{call_id}:attempt:{index}"
+
+    def _llm_event(
+        self,
+        ctx: Any,
+        kind: str,
+        title: str,
+    ) -> dict[str, Any]:
+        key = self._attempt_key(ctx)
         turn = int(getattr(ctx, "turn", 0) or 0)
-        event = self._thinking_by_turn.get(turn)
+        self._current_attempt_by_turn[turn] = key
+        bucket = self._llm_events.setdefault(key, {})
+        event = bucket.get(kind)
         if event is None:
-            event = self._append("thinking", "thinking", "", turn=turn)
-            self._thinking_by_turn[turn] = event
-        detail = str(event.get("detail") or "") + delta
-        if len(detail) > self._DETAIL_LIMIT:
-            detail = detail[:self._DETAIL_LIMIT] + "\n… truncated in live view"
-        event["detail"] = detail
+            event = self._append(
+                kind,
+                title,
+                "",
+                turn=turn,
+                attempt_id=key,
+                call_id=str(getattr(ctx, "call_id", "") or ""),
+                draft=True,
+            )
+            bucket[kind] = event
+        return event
+
+    def _remove_attempt(self, attempt_id: str) -> None:
+        for event in self._llm_events.pop(attempt_id, {}).values():
+            with contextlib.suppress(ValueError):
+                self.session.activity_events.remove(event)
+
+    def _remove_rolled_back_call(self, turn: int, call_id: str) -> None:
+        for attempt_id, events in list(self._llm_events.items()):
+            if any(
+                int(event.get("turn") or 0) == turn and str(event.get("call_id") or "") == call_id
+                for event in events.values()
+            ):
+                self._remove_attempt(attempt_id)
+
+    async def on_llm_delta(self, ctx: Any) -> None:
+        for kind, title, delta in (
+            (
+                "thinking",
+                "reasoning summary",
+                str(
+                    getattr(ctx, "thinking_delta", "") or "",
+                ),
+            ),
+            ("message", "assistant draft", str(getattr(ctx, "delta", "") or "")),
+        ):
+            if not delta:
+                continue
+            event = self._llm_event(ctx, kind, title)
+            detail = str(event.get("detail") or "") + delta
+            if len(detail) > self._DETAIL_LIMIT:
+                detail = detail[: self._DETAIL_LIMIT] + "\n… truncated in live view"
+            event["detail"] = detail
+
+    async def on_llm_attempt(self, ctx: Any) -> None:
+        call_id = str(getattr(ctx, "call_id", "") or "")
+        turn = int(getattr(ctx, "turn", 0) or 0)
+        if getattr(ctx, "phase", "") == "started" and call_id:
+            supersession = self._call_supersession.note(ctx)
+            if supersession.turn_changed:
+                # Older activity rows remain in the bounded session deque, but
+                # only the current turn can still be rolled back. Drop stale
+                # object references so long-lived reusable sessions stay
+                # memory-bounded independently of deque eviction.
+                self._llm_events.clear()
+                self._current_attempt_by_turn.clear()
+                self._current_call_by_turn.clear()
+            superseded_call = supersession.superseded_call_id
+            if superseded_call:
+                self._remove_rolled_back_call(turn, superseded_call)
+            self._current_attempt_by_turn[turn] = self._attempt_key(ctx)
+            self._current_call_by_turn[turn] = call_id
+
+        attempt_id = self._attempt_key(ctx)
+        outcome = str(getattr(ctx, "outcome", "") or "")
+        if outcome in (ATTEMPT_DISCARDED, ATTEMPT_FAILED):
+            self._remove_attempt(attempt_id)
+        elif outcome in DELIVERED_ATTEMPT_OUTCOMES:
+            for event in self._llm_events.get(attempt_id, {}).values():
+                event["draft"] = False
 
     async def on_llm_response(self, ctx: Any) -> None:
+        turn = int(getattr(ctx, "turn", 0) or 0)
+        attempt_id = self._current_attempt_by_turn.get(turn, f"turn:{turn}")
+        call_id = self._current_call_by_turn.get(turn, "")
+        bucket = self._llm_events.setdefault(attempt_id, {})
         thinking = str(getattr(ctx, "thinking", "") or "").strip()
         if thinking:
-            turn = int(getattr(ctx, "turn", 0) or 0)
-            event = self._thinking_by_turn.get(turn)
+            event = bucket.get("thinking")
             if event is None:
-                self._thinking_by_turn[turn] = self._append(
-                    "thinking", "thinking", thinking, turn=turn,
+                event = self._append(
+                    "thinking",
+                    "reasoning summary",
+                    thinking,
+                    turn=turn,
+                    attempt_id=attempt_id,
+                    call_id=call_id,
                 )
-            else:
-                event["detail"] = thinking[:self._DETAIL_LIMIT]
+                bucket["thinking"] = event
+            event["detail"] = thinking[: self._DETAIL_LIMIT]
+            event["draft"] = False
         text = str(getattr(ctx, "ai_text", "") or "").strip()
         if text:
-            self._append(
-                "message", "assistant", text,
-                turn=int(getattr(ctx, "turn", 0) or 0),
-            )
+            event = bucket.get("message")
+            if event is None:
+                event = self._append(
+                    "message",
+                    "assistant",
+                    text,
+                    turn=turn,
+                    attempt_id=attempt_id,
+                    call_id=call_id,
+                )
+                bucket["message"] = event
+            event["title"] = "assistant"
+            event["detail"] = text[: self._DETAIL_LIMIT]
+            event["draft"] = False
 
     async def on_tool_call(self, ctx: Any, tool_call: dict[str, Any]) -> None:
         name = str(tool_call.get("name") or "tool")
