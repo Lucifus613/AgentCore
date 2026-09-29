@@ -20,6 +20,7 @@ from agent_core.loop_types import (
     ATTEMPT_ACCEPTED_DEGRADED,
     ATTEMPT_DISCARDED,
     ATTEMPT_FAILED,
+    WALL_LLM_REFUSE_S,
 )
 from agent_core.messages import Message, user_msg
 from agent_core.runtime.llm_request_overrides import (
@@ -142,7 +143,10 @@ def _llm_gate() -> asyncio.Semaphore | None:
 # reserve instead. The remaining budget is not read from here: the product
 # owns that lookup and injects it as the ``wall_deadline_remaining``
 # callback, so this package never touches context-local storage.
-_WALL_DEADLINE_FLOOR_S = 20.0
+# The value is the public ``loop_types.WALL_LLM_REFUSE_S`` so a host observer
+# can refuse a new call at exactly the threshold this loop refuses at; the
+# private name stays because tests rebind it on this module.
+_WALL_DEADLINE_FLOOR_S = WALL_LLM_REFUSE_S
 
 # Floor for the non-streaming replay that recovers a tool call whose streamed
 # arguments came back empty. The replay is opportunistic: below this many
@@ -303,6 +307,15 @@ async def call_llm(
 
     def _chain_fallback_active() -> bool:
         return bool(chain_fallback_active and chain_fallback_active())
+
+    def _wall_deadline_exhausted(remaining: float | None, reason: str) -> bool:
+        """The run's wall budget is inside the attempt floor: nothing useful
+        can be started or retried, whichever path noticed it first."""
+        return (
+            remaining is not None
+            and reason == "wall_deadline"
+            and remaining < _WALL_DEADLINE_FLOOR_S
+        )
 
     def _effective_timeout_or_deadline_exhausted(
         *, attempt: int, reason: str,
@@ -986,10 +999,13 @@ async def call_llm(
                 and deadline_remaining is not None
                 and deadline_remaining <= 0
                 and deadline_reason == attempt_deadline_reason
-            ):
+            ) or _wall_deadline_exhausted(deadline_remaining, deadline_reason):
                 deadline_exc = LLMDeadlineExceeded(
                     deadline_reason,
-                    "deadline-clamped provider attempt exhausted its budget",
+                    "deadline-clamped provider attempt exhausted its budget"
+                    if deadline_remaining is not None and deadline_remaining <= 0
+                    else f"attempt timed out with {deadline_remaining:.0f}s left "
+                    f"< {_WALL_DEADLINE_FLOOR_S:.0f}s attempt floor",
                 )
                 await _finish_attempt(
                     outcome=ATTEMPT_FAILED,
@@ -1183,6 +1199,29 @@ async def call_llm(
             )
             await asyncio.sleep(backoff)
         else:
+            # The last attempt failed with the wall budget already inside the
+            # floor: report the deadline, not "exhausted". The caller tells
+            # "the run is out of wall time, go land" from "the retries are
+            # spent" by this reason.
+            deadline_remaining, deadline_reason = _nearest_deadline()
+            if _wall_deadline_exhausted(deadline_remaining, deadline_reason):
+                await _finish_attempt(
+                    outcome=ATTEMPT_FAILED,
+                    reason=deadline_reason,
+                    recovery_action="raise",
+                    error=retry_error,
+                )
+                # ``deadline_remaining`` is not None: ``_wall_deadline_exhausted``
+                # checked. The dedicated exception type keeps a provider-chain
+                # policy from reading this as an ordinary transient failure.
+                deadline_exc = LLMDeadlineExceeded(
+                    deadline_reason,
+                    f"final attempt failed with {deadline_remaining:.0f}s left "
+                    f"< {_WALL_DEADLINE_FLOOR_S:.0f}s attempt floor",
+                )
+                raise LLMCallExhausted(
+                    deadline_exc, deadline_reason, prior_exc=retry_error
+                ) from deadline_exc
             await _finish_attempt(
                 outcome=ATTEMPT_FAILED,
                 reason=retry_reason,

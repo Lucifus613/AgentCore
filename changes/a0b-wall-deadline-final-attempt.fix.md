@@ -1,0 +1,1 @@
+An LLM call whose timed-out or final attempt fails with the run's wall budget already inside the 20 s attempt floor now surfaces as `wall_deadline` (with `LLMDeadlineExceeded`) instead of `exhausted`. The threshold is public as `loop_types.WALL_LLM_REFUSE_S`.

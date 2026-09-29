@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Absolute monotonic soft deadline stored in execution-scope metadata.
 WALL_DEADLINE_MONOTONIC_KEY = "wall_deadline_monotonic"
+WALL_LLM_REFUSE_S = 20.0
 
 
 class UsageMetadataExtras(TypedDict, total=False):
@@ -756,6 +757,7 @@ __all__ = [
     "ATTEMPT_FAILED",
     "DELIVERED_ATTEMPT_OUTCOMES",
     "WALL_DEADLINE_MONOTONIC_KEY",
+    "WALL_LLM_REFUSE_S",
     "AgentLoopResult",
     "BaseObserver",
     "CancellationObserver",
