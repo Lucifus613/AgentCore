@@ -1,0 +1,1 @@
+AgentBus completes every job through one protocol: `SubAgentRuntimeSpec.job_finalizer` runs once, `durable_result_sink` finishes before the result is published (even under cancellation), `reserve_session_job_id()` / `reserved_job_id=` pre-name a session job, and `JobEntry` / `PendingSessionTask` carry a monotonic submit ordinal. `_mark_job_aborted` is now async.

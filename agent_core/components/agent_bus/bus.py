@@ -27,6 +27,12 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from agent_core.components.agent_bus.job_finish import (
+    _utc_now,
+    finish_job,
+    publish_entry,
+    terminal_task_result,
+)
 from agent_core.components.agent_bus.models import (
     CollectResult,
     DepthLimitExceeded,
@@ -426,6 +432,7 @@ class AgentBus:
         existing zero-arg ``AgentBus()`` callers continue to work.
         """
         self._jobs: dict[str, JobEntry] = {}
+        self._job_finish_locks: dict[str, asyncio.Lock] = {}
         self._counter: int = 0
         self._spawn_guard: SpawnGuard | None = None
         self._sub_agent_profiles: dict[str, dict[str, SubAgentProfile]] = {}
@@ -570,6 +577,18 @@ class AgentBus:
     def _next_job_id(self, parent_task_id: str) -> str:
         self._counter += 1
         return f"{parent_task_id}.job.{self._counter}"
+
+    def reserve_session_job_id(self, session_id: str) -> str:
+        """Reserve the real job id before an external authorization commits.
+
+        Publication ownership needs the exact AgentBus identity in its durable
+        intent before the task is allowed to enter the session queue. The
+        returned id must be passed back as ``reserved_job_id`` exactly once.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise KeyError(f"Session {session_id!r} not found")
+        return self._next_job_id(session.task_id)
 
     # ── submit: non-blocking ────────────────────────────────────────────
 
@@ -763,17 +782,16 @@ class AgentBus:
             if guard:
                 await guard.acquire_slot(job_id)
             entry.status = "running"
+            entry.started_at = time.monotonic()
+            entry.started_at_utc = _utc_now()
             try:
                 result = await _run()
-                entry.result = result
-                entry.completed_at = time.monotonic()
-                if result.error == "aborted":
-                    entry.status = "aborted"
-                elif result.success:
-                    entry.status = "completed"
-                else:
-                    entry.status = "failed"
-                return result
+                return await finish_job(
+                    self,
+                    entry,
+                    result,
+                    runtime,
+                )
             finally:
                 # Layer 1: RAII release — always release guard slot
                 if guard:
@@ -789,7 +807,10 @@ class AgentBus:
             item=item,
             task=None,
             status="submitted",
+            task_index=self._counter,
             submitted_at=time.monotonic(),
+            submitted_at_utc=_utc_now(),
+            runtime_spec=runtime,
         )
         self._jobs[job_id] = entry
         try:
@@ -867,6 +888,9 @@ class AgentBus:
             for task in done:
                 jid = tasks_to_wait[task]
                 entry = self._jobs.get(jid)
+                if entry is not None and entry.result is None:
+                    terminal, _synthesized = terminal_task_result(entry, task)
+                    await finish_job(self, entry, terminal)
                 if entry and entry.result:
                     if entry.result.success:
                         result.completed.append(entry.result)
@@ -918,7 +942,7 @@ class AgentBus:
             # Queued task: scrub from the session's pending deque,
             # release any guard reservation, and finalise as aborted.
             self._purge_queued_job(job_id)
-            self._mark_job_aborted(job_id, entry)
+            await self._mark_job_aborted(job_id, entry)
         else:
             # Running task: cancel the asyncio task and let
             # _run_and_finalize observe the CancelledError.
@@ -931,7 +955,7 @@ class AgentBus:
             if entry.result and entry.result.success:
                 entry.status = "completed"
             elif entry.status not in ("completed", "failed"):
-                self._mark_job_aborted(job_id, entry)
+                await self._mark_job_aborted(job_id, entry)
 
         event_store = self._event_sink()
         if event_store:
@@ -975,7 +999,7 @@ class AgentBus:
         for jid, entry in mine:
             if entry.status == "queued" or entry.task is None:
                 self._purge_queued_job(jid)
-                self._mark_job_aborted(jid, entry)
+                await self._mark_job_aborted(jid, entry)
                 cancelled += 1
 
         for jid, entry in mine:
@@ -994,7 +1018,7 @@ class AgentBus:
             # so gating the count on which of the two happened reported 0 for a
             # round that really did tear down every running sub-agent.
             if entry.status not in ("completed", "failed", "aborted"):
-                self._mark_job_aborted(jid, entry)
+                await self._mark_job_aborted(jid, entry)
             cancelled += 1
         if cancelled:
             logger.info(
@@ -1028,8 +1052,12 @@ class AgentBus:
                     self._spawn_guard.release(job_id)
                 return
 
-    def _mark_job_aborted(
-        self, job_id: str, entry: JobEntry | None = None,
+    async def _mark_job_aborted(
+        self,
+        job_id: str,
+        entry: JobEntry | None = None,
+        *,
+        durable: bool = True,
     ) -> None:
         """Mark a job aborted and release any SpawnGuard reservation.
 
@@ -1041,14 +1069,12 @@ class AgentBus:
         if self._spawn_guard is not None:
             self._spawn_guard.release(job_id)
         entry = entry or self._jobs.get(job_id)
-        if entry is None or entry.status in ("completed", "failed", "aborted"):
+        if entry is None:
             return
-        entry.status = "aborted"
-        entry.completed_at = time.monotonic()
         if entry.result is not None:
             return
         item = entry.item
-        entry.result = SubAgentResult(
+        result = SubAgentResult(
             question=str(getattr(item, "question", "") or ""),
             role_id=str(getattr(item, "role_id", "") or ""),
             final_content="",
@@ -1057,6 +1083,10 @@ class AgentBus:
             error_class="CancelledError",
             job_id=job_id,
         )
+        if durable:
+            await finish_job(self, entry, result)
+        else:
+            publish_entry(entry, result)
 
     # ── get_job_status: query job state ─────────────────────────────────
 
@@ -1193,6 +1223,7 @@ class AgentBus:
         runtime_spec: SubAgentRuntimeSpec | None = None,
         spawn_context: dict[str, Any] | None = None,
         task_metadata: dict[str, Any] | None = None,
+        reserved_job_id: str | None = None,
     ) -> str:
         """Queue a task on an existing session. Non-blocking: returns job_id.
 
@@ -1228,7 +1259,26 @@ class AgentBus:
         # so future recursive workflows don't silently bypass it.
         dispatch_depth = 1
 
-        job_id = self._next_job_id(session.task_id)
+        job_id = reserved_job_id or self._next_job_id(session.task_id)
+        if reserved_job_id and not job_id.startswith(f"{session.task_id}.job."):
+            raise ValueError(
+                f"reserved job id {job_id!r} does not belong to session {session_id!r}"
+            )
+        if job_id in self._jobs:
+            raise ValueError(f"job id {job_id!r} has already been submitted")
+
+        # Layer 5+3: SpawnGuard pre-check at submit time (not at dispatch)
+        # so queued tasks still raise BudgetExhausted / SpawnDepthExceeded
+        # synchronously at the API boundary — preserves the legacy
+        # behaviour that callers see budget errors immediately rather
+        # than only via ``collect_reports`` after the queue drains.
+        # It runs before the ordinal is taken, so a refused submission
+        # consumes no ``task_index``.
+        if guard is not None:
+            await guard.pre_check(job_id, dispatch_depth, estimated_tokens)
+
+        session.next_task_index += 1
+        task_index = session.next_task_index
         pending = PendingSessionTask(
             job_id=job_id,
             task_prompt=task_prompt,
@@ -1238,15 +1288,8 @@ class AgentBus:
             runtime_spec=runtime_spec,
             spawn_context=dict(spawn_context) if spawn_context else None,
             task_metadata=dict(task_metadata or {}),
+            task_index=task_index,
         )
-
-        # Layer 5+3: SpawnGuard pre-check at submit time (not at dispatch)
-        # so queued tasks still raise BudgetExhausted / SpawnDepthExceeded
-        # synchronously at the API boundary — preserves the legacy
-        # behaviour that callers see budget errors immediately rather
-        # than only via ``collect_reports`` after the queue drains.
-        if guard is not None:
-            await guard.pre_check(job_id, dispatch_depth, estimated_tokens)
 
         # Past the pre-check the reservation has no RAII owner yet: it passes
         # to ``session.pending_tasks`` (released when the queue drains and the
@@ -1302,7 +1345,10 @@ class AgentBus:
                 ),
                 task=None,
                 status="queued",
+                task_index=pending.task_index,
                 submitted_at=time.monotonic(),
+                submitted_at_utc=_utc_now(),
+                runtime_spec=pending.runtime_spec or session.runtime_spec,
             )
             self._jobs[job_id] = entry
             session.pending_tasks.append(pending)
@@ -1415,11 +1461,10 @@ class AgentBus:
                     )
 
                 if active_runtime.observers_builder is not None:
-                    # Pass task_index as the 1-based ordinal within the session
-                    # (session.total_task_count was already incremented before
-                    # this _run closure was constructed).
                     loop_observers = active_runtime.observers_builder(
-                        job_id, session_item, session.total_task_count,
+                        job_id,
+                        session_item,
+                        pending.task_index,
                     )
                 else:
                     loop_observers = _resolve_session_observers(
@@ -1484,7 +1529,7 @@ class AgentBus:
                         forced = active_runtime.force_finalizer(
                             raw_result, session_item,
                         )
-                        if asyncio.iscoroutine(forced):
+                        if inspect.isawaitable(forced):
                             forced = await forced
                         if forced is not None:
                             raw_result = forced
@@ -1512,17 +1557,18 @@ class AgentBus:
                 final_text = (raw_result.final_content or "").strip()
                 start_idx, _ = session.task_boundaries[-1]
                 provisional_end = len(session.messages) - 1
-                if find_final_assistant(
-                    session.messages, start_idx + 1, provisional_end,
-                ) is None:
-                    stopped = (
-                        getattr(raw_result, "stopped_by", "")
-                        or "unknown"
+                if (
+                    find_final_assistant(
+                        session.messages,
+                        start_idx + 1,
+                        provisional_end,
                     )
+                    is None
+                ):
+                    stopped = getattr(raw_result, "stopped_by", "") or "unknown"
                     stub_text = (
                         final_text
-                        or f"[task ended without a clean final answer "
-                           f"(stopped_by={stopped})]"
+                        or f"[task ended without a clean final answer (stopped_by={stopped})]"
                     )
                     session.messages.append(assistant_msg(stub_text))
 
@@ -1597,16 +1643,17 @@ class AgentBus:
             if guard is not None:
                 await guard.acquire_slot(job_id)
             entry.status = "running"
+            entry.started_at = time.monotonic()
+            entry.started_at_utc = _utc_now()
             try:
                 result = await _run()
-                entry.result = result
-                entry.completed_at = time.monotonic()
-                if result.error == "aborted":
-                    entry.status = "aborted"
-                elif result.success:
-                    entry.status = "completed"
-                else:
-                    entry.status = "failed"
+                result = await finish_job(
+                    self,
+                    entry,
+                    result,
+                    active_runtime,
+                    session=session,
+                )
                 if pending.task_metadata.get("can_publish") is True:
                     stopped_by = str(result.metadata.get("stopped_by") or "")
                     tool_calls = int(result.metadata.get("tool_calls_count", 0) or 0)
@@ -1623,10 +1670,6 @@ class AgentBus:
                         # accumulated credit so it does not permanently inflate
                         # this session's task cap for the rest of the run.
                         session.publisher_no_tool_failures = 0
-                # Enqueue for wait_any_session regardless of success/failure
-                # so callers can observe errors (matching AgentTeam behavior
-                # where failed agents also emit a <report>).
-                session.pending_results.append(result)
                 await _emit_session_task_completed(
                     session, job_id, result,
                     event_sink=self._event_sink(),
@@ -1675,6 +1718,8 @@ class AgentBus:
         if existing is not None:
             existing.status = "submitted"
             existing.submitted_at = existing.submitted_at or time.monotonic()
+            existing.submitted_at_utc = existing.submitted_at_utc or _utc_now()
+            existing.runtime_spec = active_runtime
             entry = existing
         else:
             entry = JobEntry(
@@ -1687,7 +1732,10 @@ class AgentBus:
                 ),
                 task=None,
                 status="submitted",
+                task_index=pending.task_index,
                 submitted_at=time.monotonic(),
+                submitted_at_utc=_utc_now(),
+                runtime_spec=active_runtime,
             )
             self._jobs[job_id] = entry
         session.current_job_id = job_id
@@ -1730,7 +1778,7 @@ class AgentBus:
                 await task
             if entry.status not in ("completed", "failed", "aborted"):
                 _close_session_boundary_aborted(session)
-                self._mark_job_aborted(job_id, entry)
+                await self._mark_job_aborted(job_id, entry)
             if session.current_job_id == job_id:
                 session.current_job_id = None
             raise
@@ -1817,52 +1865,16 @@ class AgentBus:
             if entry is None or task is None or not task.done():
                 continue
 
-            result = entry.result
-            if result is None and not task.cancelled():
-                try:
-                    task_result = task.result()
-                except (asyncio.CancelledError, Exception) as exc:
-                    error = str(exc) or type(exc).__name__
-                    error_class = type(exc).__name__
-                else:
-                    if isinstance(task_result, SubAgentResult):
-                        result = task_result
-                        error = ""
-                        error_class = ""
-                    else:
-                        error = "sub-agent task ended without a report"
-                        error_class = "MissingSubAgentResult"
-            elif result is None:
-                error = "sub-agent task was cancelled before publishing a report"
-                error_class = "CancelledError"
-            else:
-                error = ""
-                error_class = ""
-
-            if result is None:
-                result = SubAgentResult(
-                    question=str(getattr(entry.item, "question", "") or ""),
-                    role_id=str(getattr(entry.item, "role_id", "") or ""),
-                    final_content="",
-                    success=False,
-                    error=error,
-                    error_class=error_class,
-                    job_id=job_id,
-                )
+            result, synthesized = terminal_task_result(entry, task)
+            if synthesized:
                 _close_session_boundary_aborted(session)
 
-            entry.result = result
-            entry.completed_at = entry.completed_at or time.monotonic()
-            entry.status = (
-                "completed" if result.success
-                else "aborted" if result.error_class == "CancelledError"
-                else "failed"
-            )
-            if not any(item.job_id == job_id for item in session.pending_results):
-                session.pending_results.append(result)
+            result = await finish_job(self, entry, result, session=session)
             if entry.submitted_at:
+                completed_at = entry.completed_at or time.monotonic()
                 session.last_task_elapsed_s = max(
-                    0.0, entry.completed_at - entry.submitted_at,
+                    0.0,
+                    completed_at - entry.submitted_at,
                 )
             if session.current_job_id == job_id:
                 session.current_job_id = None
@@ -1870,8 +1882,9 @@ class AgentBus:
                 self._spawn_guard.release(job_id)
             sessions_to_drain.append(session)
             logger.warning(
-                "Reconciled terminal sub-agent job without a published report: "
-                "%s (%s)", job_id, result.error_class or entry.status,
+                "Reconciled terminal sub-agent job without a published report: %s (%s)",
+                job_id,
+                result.error_class or entry.status,
             )
 
         for session in sessions_to_drain:
@@ -2234,12 +2247,13 @@ class AgentBus:
                 rescued_evidence.extend(md.get("evidence_cards") or [])
                 rescued_assertions.extend(md.get("assertions") or [])
 
-        def abort_pending_tasks(session: SubAgentSession) -> None:
+        async def abort_pending_tasks(session: SubAgentSession) -> None:
             while session.pending_tasks:
                 pending = session.pending_tasks.popleft()
-                self._mark_job_aborted(
+                await self._mark_job_aborted(
                     pending.job_id,
                     self._jobs.get(pending.job_id),
+                    durable=False,
                 )
 
         cleaned = 0
@@ -2251,7 +2265,7 @@ class AgentBus:
             rescue_pending_results(session)
             # Prevent the running task's ``finally`` from draining queued
             # successors while cleanup is tearing this session down.
-            abort_pending_tasks(session)
+            await abort_pending_tasks(session)
             if session.current_job_id is not None:
                 current_job_id = session.current_job_id
                 entry = self._jobs.get(session.current_job_id)
@@ -2269,11 +2283,11 @@ class AgentBus:
                     except Exception:
                         pass
                     if entry.status not in ("completed", "failed", "aborted"):
-                        self._mark_job_aborted(current_job_id, entry)
+                        await self._mark_job_aborted(current_job_id, entry)
                 elif entry is not None and entry.status not in (
                     "completed", "failed", "aborted",
                 ):
-                    self._mark_job_aborted(current_job_id, entry)
+                    await self._mark_job_aborted(current_job_id, entry)
             # A cancelled job can catch CancelledError, build a
             # SubAgentResult, and append it to pending_results while
             # cleanup is awaiting entry.task. Rescue again immediately

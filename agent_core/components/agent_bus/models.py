@@ -55,6 +55,20 @@ class SubAgentResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class JobStamp:
+    """Kernel clock snapshot passed to the before-publish durability sink.
+
+    This is transport metadata for the completion protocol, not part of the
+    workflow-owned artifact journal schema or ``SubAgentResult.metadata``.
+    """
+
+    task_index: int
+    started_at: str
+    finished_at: str
+    duration_ms: int
+
+
 @dataclass(slots=True)
 class JobEntry:
     """Tracks a single async sub-agent job.
@@ -74,7 +88,13 @@ class JobEntry:
         "queued", "submitted", "running", "completed", "failed", "aborted"
     ] = "submitted"
     result: SubAgentResult | None = None
+    runtime_spec: SubAgentRuntimeSpec | None = None
+    finalizer_called: bool = False
+    task_index: int = 0
     submitted_at: float = 0.0
+    submitted_at_utc: str = ""
+    started_at: float = 0.0
+    started_at_utc: str = ""
     completed_at: float | None = None
 
 
@@ -102,6 +122,7 @@ class PendingSessionTask:
     # (parent → child + the exact instruction).
     spawn_context: dict[str, Any] | None = None
     task_metadata: dict[str, Any] = field(default_factory=dict)
+    task_index: int = 0
 
 
 @dataclass
@@ -144,9 +165,10 @@ class SubAgentRuntimeSpec:
     """Optional runtime injection for generic sub-agent execution."""
 
     config_builder: Callable[[str, SubTask, int], Any] | None = None
-    # ``task_index`` is the 1-based ordinal of this task within the
-    # session (== ``session.total_task_count`` at submit time). Lets
-    # observers tell first-run from reuse without consulting the bus.
+    # ``task_index`` is the 1-based ``next_task_index`` ordinal assigned at
+    # submit time (queued tasks later aborted keep theirs), independent of
+    # ``total_task_count``. Lets observers tell first-run from reuse without
+    # consulting the bus.
     observers_builder: Callable[
         [str, SubTask, int], list[Any]
     ] | None = None
@@ -154,6 +176,18 @@ class SubAgentRuntimeSpec:
     result_adapter: Callable[
         [Any, str, SubTask],
         SubAgentResult | Awaitable[SubAgentResult],
+    ] | None = None
+    # Runs exactly once when the job reaches any terminal state. The result
+    # has already passed through ``result_adapter`` when that path completed.
+    job_finalizer: Callable[
+        [SubAgentResult, str, SubTask],
+        SubAgentResult | Awaitable[SubAgentResult],
+    ] | None = None
+    # Optional workflow-owned durability seam. Its awaitable must finish
+    # before the bus publishes the result.
+    durable_result_sink: Callable[
+        [SubAgentResult, str, SubTask, JobStamp],
+        Awaitable[None],
     ] | None = None
     model_profile: Any = None
     history_policy: Any = None
@@ -218,6 +252,9 @@ class SubAgentSession:
     messages: list[Message] = field(default_factory=list)
     task_boundaries: list[TaskBoundary] = field(default_factory=list)
     total_task_count: int = 0
+    # Monotonic 1-based submit ordinal, including queued tasks later aborted.
+    # ``total_task_count`` remains the count of tasks that opened a boundary.
+    next_task_index: int = 0
     current_job_id: str | None = None
     # Wall-clock seconds the most recently finished task took. Kept so a
     # progress snapshot can report a *stable* duration for an idle session:
