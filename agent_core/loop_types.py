@@ -298,6 +298,45 @@ class LLMAttemptContext:
     metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
+@dataclass(frozen=True)
+class CallSupersessionResult:
+    """State transition reported by :class:`CallSupersessionTracker`."""
+
+    superseded_call_id: str = ""
+    turn_changed: bool = False
+
+
+@dataclass
+class CallSupersessionTracker:
+    """Detect when a new logical call replaces a delivered call in one turn."""
+
+    _last_turn: int = 0
+    _last_call_id: str = ""
+
+    def note(self, ctx: LLMAttemptContext) -> CallSupersessionResult:
+        """Record a call notification and return its state transition.
+
+        Repeated lifecycle notifications for the same call are idempotent.
+        Consumers may therefore observe either the started or finished phase.
+        """
+        if not ctx.call_id:
+            return CallSupersessionResult()
+        turn_changed = bool(
+            self._last_call_id and ctx.turn != self._last_turn
+        )
+        superseded = (
+            self._last_call_id
+            if ctx.turn == self._last_turn and ctx.call_id != self._last_call_id
+            else ""
+        )
+        self._last_turn = ctx.turn
+        self._last_call_id = ctx.call_id
+        return CallSupersessionResult(
+            superseded_call_id=superseded,
+            turn_changed=turn_changed,
+        )
+
+
 @dataclass
 class ToolResult:
     name: str
@@ -760,6 +799,8 @@ __all__ = [
     "WALL_LLM_REFUSE_S",
     "AgentLoopResult",
     "BaseObserver",
+    "CallSupersessionResult",
+    "CallSupersessionTracker",
     "CancellationObserver",
     "CompactionEvent",
     "CompactionObserver",

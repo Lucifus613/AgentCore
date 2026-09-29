@@ -1,0 +1,1 @@
+The session activity trail is attempt-local: draft rows are marked, discarded or superseded attempts are rolled back, and `loop_types.CallSupersessionTracker` detects a call replacing another within a turn.
