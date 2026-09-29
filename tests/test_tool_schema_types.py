@@ -9,11 +9,11 @@ validation alone.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
-from agent_core.tool import tool
+from agent_core.tool import _schema_for_type, tool
 
 
 def _properties(t: Any) -> dict[str, Any]:
@@ -108,3 +108,23 @@ def test_a_pep695_alias_survives_being_an_items_type() -> None:
         "string", "number", "boolean",
     }
     assert not _walk(schema, "rows")
+
+
+def test_literal_publishes_its_legal_values() -> None:
+    assert _schema_for_type(Literal["a", "b"]) == {"type": "string", "enum": ["a", "b"]}
+    assert _schema_for_type(Literal[1, 2]) == {"type": "integer", "enum": [1, 2]}
+    assert _schema_for_type(Literal["a", 1]) == {"enum": ["a", 1]}
+
+
+def test_nullable_literal_admits_null_in_enum_and_type() -> None:
+    schema = _schema_for_type(Literal["a", "b"] | None)
+
+    assert schema["enum"] == ["a", "b", None]
+    assert schema["type"] == ["string", "null"]
+    assert schema["default"] is None
+
+
+def test_bare_and_parameterised_dict_are_objects() -> None:
+    assert _schema_for_type(dict) == {"type": "object"}
+    assert _schema_for_type(dict[str, Any]) == {"type": "object"}
+    assert _schema_for_type(dict | None)["type"] == "object"
