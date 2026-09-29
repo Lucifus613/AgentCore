@@ -32,6 +32,7 @@ from agent_core.components.agent_bus.job_finish import (
     finish_job,
     publish_entry,
     terminal_task_result,
+    wait_running_or_detach,
 )
 from agent_core.components.agent_bus.models import (
     CollectResult,
@@ -109,6 +110,26 @@ from agent_core.runtime.registries.agents import AgentRegistry
 from agent_core.tool import Tool
 
 logger = logging.getLogger(__name__)
+
+# Jobs ``cleanup_task`` cancelled, from the cancel until they have stopped.
+# Whatever they write follows the process environment; a session must not
+# rebind while any of them is alive (``running_stragglers``).
+_STRAGGLERS: dict[str, asyncio.Task[Any]] = {}
+
+
+def register_straggler(name: str, task: asyncio.Task[Any]) -> None:
+    """Keep ``task`` counted as a straggler until it has finished."""
+    if not task.done():
+        _STRAGGLERS[name] = task
+
+
+def running_stragglers() -> list[str]:
+    """Job ids of detached jobs that are still running."""
+    for job_id, task in list(_STRAGGLERS.items()):
+        # A task whose loop has closed can never run again, done or not.
+        if task.done() or task.get_loop().is_closed():
+            _STRAGGLERS.pop(job_id, None)
+    return sorted(_STRAGGLERS)
 
 
 PauseCheckFn = Callable[[], Awaitable[bool]]
@@ -2216,24 +2237,11 @@ class AgentBus:
     async def cleanup_task(
         self, task_id: str, *, cancel_timeout_s: float = 10.0,
     ) -> int:
-        """Cancel all running session tasks under ``task_id`` and drop sessions.
+        """Cancel tasks under ``task_id`` and drop their sessions.
 
-        If a sub-agent's asyncio.Task cannot be cancelled within
-        ``cancel_timeout_s`` (e.g. blocked in a non-cancellable subprocess
-        or a long socket read), we detach it, log a warning, and move on.
-        That prevents the pipeline's post-loop cleanup from hanging
-        indefinitely on stuck sub-agents, which previously caused the
-        ``main_agent → report`` transition to stall until the eval
-        driver killed the task.
-
-        Returns the number of sessions cleaned up. Also clears any residual
-        aggregate pool so re-runs don't carry over state.
-
-        Rescue: ``session.pending_results`` are merged into
-        ``_task_aggregates`` via ``accumulate_task_metadata`` before
-        sessions are dropped, so a post-cleanup ``drain_task_metadata``
-        still surfaces sub-agent reports the main agent never claimed
-        (e.g. ``force_final_answer`` short-circuited a slow sub-agent).
+        Jobs still running after ``cancel_timeout_s`` are detached so cleanup
+        cannot hang on non-cancellable I/O. Pending result metadata is rescued
+        into ``_task_aggregates`` before each session is dropped.
         """
         self._task_aggregates.pop(task_id, None)
 
@@ -2258,42 +2266,60 @@ class AgentBus:
 
         cleaned = 0
         stuck: list[str] = []
-        for sid in list(self._sessions):
-            session = self._sessions.get(sid)
-            if session is None or session.task_id != task_id:
-                continue
+        sessions = [
+            (sid, session)
+            for sid, session in list(self._sessions.items())
+            if session.task_id == task_id
+        ]
+        # Cancel every running job first, then wait for every unfinished task
+        # together, so the whole task stops within one ``cancel_timeout_s``
+        # however many sessions it has.
+        stopping: dict[str, tuple[str, JobEntry]] = {}
+        for sid, session in sessions:
             rescue_pending_results(session)
             # Prevent the running task's ``finally`` from draining queued
             # successors while cleanup is tearing this session down.
             await abort_pending_tasks(session)
-            if session.current_job_id is not None:
-                current_job_id = session.current_job_id
-                entry = self._jobs.get(session.current_job_id)
-                if entry is not None and entry.status in (
-                    "submitted", "running",
-                ) and entry.task is not None:
+            job_id = session.current_job_id
+            entry = self._jobs.get(job_id) if job_id is not None else None
+            # Whether a job still runs is its task's, not its status's, to say:
+            # a finished job's task still records events and unloads history.
+            if (
+                job_id is not None
+                and entry is not None
+                and entry.task is not None
+                and not entry.task.done()
+            ):
+                if entry.status in ("submitted", "running"):
                     entry.task.cancel()
-                    try:
-                        await asyncio.wait_for(
-                            entry.task, timeout=cancel_timeout_s,
-                        )
-                    except (TimeoutError, asyncio.CancelledError):
-                        if not entry.task.done():
-                            stuck.append(current_job_id)
-                    except Exception:
-                        pass
-                    if entry.status not in ("completed", "failed", "aborted"):
-                        await self._mark_job_aborted(current_job_id, entry)
-                elif entry is not None and entry.status not in (
-                    "completed", "failed", "aborted",
+                # A straggler from now until it has stopped: it may still
+                # write, however long this cleanup itself is kept waiting.
+                _STRAGGLERS[job_id] = entry.task
+                stopping[sid] = (job_id, entry)
+        stopped = await asyncio.gather(*(
+            wait_running_or_detach(entry.task, cancel_timeout_s)
+            for _, entry in stopping.values()
+            if entry.task is not None
+        ))
+        finished = dict(zip(stopping, stopped, strict=True))
+        for sid, session in sessions:
+            if sid in stopping:
+                job_id, entry = stopping[sid]
+                if not finished[sid]:
+                    stuck.append(job_id)
+                elif entry.status not in ("completed", "failed", "aborted"):
+                    await self._mark_job_aborted(job_id, entry)
+            elif session.current_job_id is not None:
+                entry = self._jobs.get(session.current_job_id)
+                if entry is not None and entry.status not in (
+                    "completed",
+                    "failed",
+                    "aborted",
                 ):
-                    await self._mark_job_aborted(current_job_id, entry)
-            # A cancelled job can catch CancelledError, build a
-            # SubAgentResult, and append it to pending_results while
-            # cleanup is awaiting entry.task. Rescue again immediately
-            # before dropping the session so that metadata is not lost.
+                    await self._mark_job_aborted(session.current_job_id, entry)
+            # Cancellation may enqueue while cleanup awaits the task.
             rescue_pending_results(session)
-            del self._sessions[sid]
+            self._sessions.pop(sid, None)
             cleaned += 1
         if rescued_evidence or rescued_assertions:
             self.accumulate_task_metadata(
