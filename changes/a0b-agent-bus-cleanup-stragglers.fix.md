@@ -1,0 +1,1 @@
+`AgentBus.cleanup_task` waits for all cancelled jobs together without cancelling one that is inside a durable write, detaches those that will not stop, and exposes them through `running_stragglers()` / `register_straggler()`.
