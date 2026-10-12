@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 from agent_core.context.models import BlobRef
@@ -13,6 +14,11 @@ from agent_core.context.models import BlobRef
 
 class BlobIntegrityError(ValueError):
     """Stored blob content does not match its reference."""
+
+
+# Failed puts leave directory publication owed across instances of the same root.
+_PENDING_SYNC_LOCK = threading.Lock()
+_PENDING_SYNC_THROUGH: dict[Path, Path] = {}
 
 
 class FileBlobStore:
@@ -38,9 +44,15 @@ class FileBlobStore:
 
     def _write(self, digest: str, data: bytes) -> None:
         path = self._path(digest)
-        sync_stop = self.root
-        while not sync_stop.exists():
-            sync_stop = sync_stop.parent
+        existing = self.root
+        while not existing.exists():
+            existing = existing.parent
+        with _PENDING_SYNC_LOCK:
+            sync_stop = _PENDING_SYNC_THROUGH.get(self.root, self.root)
+            if existing in sync_stop.parents:
+                sync_stop = existing
+            if sync_stop != self.root:
+                _PENDING_SYNC_THROUGH[self.root] = sync_stop
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             self._read_verified(digest, len(data))
@@ -68,6 +80,9 @@ class FileBlobStore:
             if directory == sync_stop:
                 break
             directory = directory.parent
+        with _PENDING_SYNC_LOCK:
+            if _PENDING_SYNC_THROUGH.get(self.root) == sync_stop:
+                del _PENDING_SYNC_THROUGH[self.root]
 
     async def get(self, ref: BlobRef) -> bytes:
         return await asyncio.to_thread(self._read_verified, ref.digest, ref.size)
