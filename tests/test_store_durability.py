@@ -169,11 +169,141 @@ async def test_blob_directory_sync_failure_can_be_retried(
 
 
 @pytest.mark.asyncio
+async def test_blob_existing_root_without_pending_work_stops_at_root(tmp_path, blob_io):
+    root = tmp_path / "existing" / "parent" / "blobs"
+    root.mkdir(parents=True)
+    store = FileBlobStore(root)
+    for data in (b"first", b"second"):
+        blob_io.clear()
+        ref = await store.put(data)
+        assert _synced_directories(blob_io) == [
+            _inode(store._path(ref.digest).parent), _inode(root)
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_directories", [(0,), (0, 2)])
+@pytest.mark.parametrize("another_instance", [False, True])
+async def test_blob_retry_completes_pending_ancestor_chain(
+    tmp_path, monkeypatch, blob_io, failed_directories, another_instance
+):
+    root = tmp_path / "new" / "parent" / "blobs"
+    store = FileBlobStore(root)
+    recorded_fsync = os.fsync
+    error = OSError("directory sync failed")
+
+    for failed_directory in failed_directories:
+        directory_count = 0
+
+        def failing_fsync(fd, failed_directory=failed_directory):
+            nonlocal directory_count
+            recorded_fsync(fd)
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                directory_count += 1
+                if directory_count == failed_directory + 1:
+                    raise error
+
+        monkeypatch.setattr(os, "fsync", failing_fsync)
+        blob_io.clear()
+        with pytest.raises(OSError) as caught:
+            await store.put(b"data")
+        assert caught.value is error
+        path = store._path(hashlib.sha256(b"data").hexdigest())
+        directories = [path.parent, root, root.parent, root.parent.parent, tmp_path]
+        assert _synced_directories(blob_io) == [
+            _inode(directory) for directory in directories[:failed_directory + 1]
+        ]
+        assert not list(path.parent.glob(".blob-*"))
+
+    monkeypatch.setattr(os, "fsync", recorded_fsync)
+    blob_io.clear()
+    if another_instance:
+        store = FileBlobStore(root.parent / "." / "blobs")
+    ref = await store.put(b"data")
+    assert await store.get(ref) == b"data"
+    assert _synced_directories(blob_io) == [_inode(directory) for directory in directories]
+
+    blob_io.clear()
+    ref = await store.put(b"new content")
+    assert _synced_directories(blob_io) == [_inode(store._path(ref.digest).parent), _inode(root)]
+
+
+@pytest.mark.asyncio
+async def test_blob_any_content_can_complete_pending_ancestor_sync(tmp_path, monkeypatch, blob_io):
+    root = tmp_path / "new" / "parent" / "blobs"
+    store = FileBlobStore(root)
+    recorded_fsync = os.fsync
+
+    def failing_fsync(fd):
+        recorded_fsync(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory sync failed")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    for data in (b"first", b"second"):
+        with pytest.raises(OSError, match="directory sync failed"):
+            await store.put(data)
+
+    monkeypatch.setattr(os, "fsync", recorded_fsync)
+    blob_io.clear()
+    ref = await store.put(b"second")
+    directories = [store._path(ref.digest).parent, root, root.parent, root.parent.parent, tmp_path]
+    assert _synced_directories(blob_io) == [_inode(directory) for directory in directories]
+
+    blob_io.clear()
+    ref = await store.put(b"first")
+    assert _synced_directories(blob_io) == [_inode(store._path(ref.digest).parent), _inode(root)]
+
+
+@pytest.mark.asyncio
+async def test_blob_concurrent_first_puts_sync_new_ancestors(tmp_path, monkeypatch, blob_io):
+    root = tmp_path / "new" / "parent" / "blobs"
+    barrier = threading.Barrier(4, timeout=5)
+    real_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if path.parent == root and kwargs.get("parents"):
+            barrier.wait()
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    stores = [FileBlobStore(root) for _ in range(4)]
+    contents = [f"data-{index}".encode() for index in range(4)]
+    refs = await asyncio.gather(*(
+        store.put(data) for store, data in zip(stores, contents, strict=True)
+    ))
+    directories = [store._path(ref.digest).parent for store, ref in zip(stores, refs, strict=True)]
+    directories.extend([root, root.parent, root.parent.parent, tmp_path])
+    synced = _synced_directories(blob_io)
+    assert set(synced) == {_inode(directory) for directory in directories}
+    for store, ref, data in zip(stores, refs, contents, strict=True):
+        assert await store.get(ref) == data
+
+
+@pytest.mark.asyncio
+async def test_blob_recreated_root_syncs_new_ancestor_chain(tmp_path, blob_io):
+    root = tmp_path / "new" / "parent" / "blobs"
+    store = FileBlobStore(root)
+    ref = await store.put(b"data")
+    path = store._path(ref.digest)
+    await store.delete(ref.digest)
+    path.parent.rmdir()
+    root.rmdir()
+    root.parent.rmdir()
+    root.parent.parent.rmdir()
+
+    blob_io.clear()
+    ref = await store.put(b"data")
+    directories = [store._path(ref.digest).parent, root, root.parent, root.parent.parent, tmp_path]
+    assert _synced_directories(blob_io) == [_inode(directory) for directory in directories]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["fsync", "link"])
 async def test_blob_file_sync_and_link_failures_do_not_publish(
     tmp_path, monkeypatch, blob_io, failure
 ):
-    store = FileBlobStore(tmp_path / "blobs")
+    store = FileBlobStore(tmp_path / "new" / "parent" / "blobs")
     error = OSError(f"{failure} failed")
     recorded_operation = getattr(os, failure)
 
@@ -190,6 +320,14 @@ async def test_blob_file_sync_and_link_failures_do_not_publish(
     assert not path.exists()
     assert not list(path.parent.glob(".blob-*"))
     assert _synced_directories(blob_io) == []
+
+    monkeypatch.setattr(os, failure, recorded_operation)
+    blob_io.clear()
+    ref = await store.put(b"data")
+    assert await store.get(ref) == b"data"
+    root = store.root
+    directories = [path.parent, root, root.parent, root.parent.parent, tmp_path]
+    assert _synced_directories(blob_io) == [_inode(directory) for directory in directories]
 
 
 @pytest.mark.asyncio
@@ -324,6 +462,39 @@ async def test_journal_identical_retry_returns_original_record(tmp_path, with_bl
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM context_journal_blobs").fetchone()[0] == len(blobs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_values, retry_values", [
+    ((1, 2), (1, 2)), ((1, 2), [1, 2]), ([1, 2], (1, 2)),
+])
+async def test_journal_retry_returns_normalized_payload(tmp_path, first_values, retry_values):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    entry = JournalEntry(
+        ContextScope("session", "run", "agent"), "turn", payload={"values": first_values},
+    )
+    first = await store.append(entry)
+    retry = replace(entry, payload={"values": retry_values})
+    assert await store.append(retry) == first
+    assert await store.list_entries(entry.scope) == [first]
+    assert first.payload == {"values": [1, 2]}
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_journal_retry_returns_normalized_empty_media_type(tmp_path):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    entry = JournalEntry(
+        ContextScope("session", "run", "agent"), "turn",
+        blobs={"report": BlobRef("a" * 64, 3, "")},
+    )
+    first = await store.append(entry)
+    assert await store.append(entry) == first
+    assert await store.list_entries(entry.scope) == [first]
+    assert first.blobs["report"].media_type == "application/octet-stream"
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 1
 
 
 @pytest.mark.asyncio

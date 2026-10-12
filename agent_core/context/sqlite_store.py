@@ -112,7 +112,7 @@ class SQLiteJournalStore:
                 blobs_json,
             )
             try:
-                cursor = connection.execute(
+                connection.execute(
                     """INSERT INTO context_journal
                     (entry_id, session_id, run_id, agent_id, kind, payload_json, blobs_json, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -141,18 +141,12 @@ class SQLiteJournalStore:
                 "INSERT INTO context_journal_blobs(entry_id, digest) VALUES (?, ?)",
                 ((entry.entry_id, ref.digest) for ref in entry.blobs.values()),
             )
-            sequence = cursor.lastrowid
-        if sequence is None:
-            raise RuntimeError("SQLite did not assign a journal sequence")
-        return JournalEntry(
-            scope=entry.scope,
-            kind=entry.kind,
-            payload=dict(entry.payload),
-            blobs=dict(entry.blobs),
-            entry_id=entry.entry_id,
-            sequence=int(sequence),
-            created_at=entry.created_at,
-        )
+            row = connection.execute(
+                "SELECT * FROM context_journal WHERE entry_id = ?", (entry.entry_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("SQLite did not store a journal entry")
+        return self._decode(row)
 
     async def list_entries(
         self,
