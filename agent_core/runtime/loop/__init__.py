@@ -2,6 +2,8 @@
 
 from agent_core.runtime.loop.agent_loop import (
     AgentLoopHooks,
+    LoopResumeState,
+    LoopStateHook,
     TurnToolSet,
     run_agent_loop,
 )
@@ -100,6 +102,8 @@ __all__ = [
     "LLMReasoningRunaway",
     "LLMStreamStalled",
     "LLMSummaryCompactor",
+    "LoopResumeState",
+    "LoopStateHook",
     "MessageTrimmer",
     "ModelProfile",
     "MultiFormatToolCallParser",
