@@ -1,15 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import sqlite3
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import agent_core.context as context
-from agent_core.context import BlobRef, FileBlobStore
+from agent_core.context import (
+    BlobRef,
+    ContextScope,
+    FileBlobStore,
+    JournalEntry,
+    SQLiteJournalStore,
+)
 
 
 def _inode(path: Path) -> tuple[int, int]:
@@ -201,3 +213,224 @@ async def test_blob_rejects_invalid_digest(tmp_path):
     store = FileBlobStore(tmp_path / "blobs")
     with pytest.raises(ValueError, match="invalid SHA-256 digest"):
         await store.get(BlobRef(digest="../invalid", size=0))
+
+
+@pytest.mark.asyncio
+async def test_journal_sets_and_reads_back_durability_pragmas(tmp_path, monkeypatch):
+    statements = []
+    real_connect = sqlite3.connect
+
+    class RecordingConnection(sqlite3.Connection):
+        def execute(self, sql, *args):
+            statements.append(sql)
+            return super().execute(sql, *args)
+
+    def connect(*args, **kwargs):
+        return real_connect(*args, **kwargs, factory=RecordingConnection)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    entry = JournalEntry(ContextScope("session", "run", "agent"), "turn")
+    await store.append(entry)
+    connection = store._connect()
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    finally:
+        connection.close()
+    expected = [
+        "PRAGMA foreign_keys=ON",
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA journal_mode",
+        "PRAGMA synchronous=FULL",
+        "PRAGMA synchronous",
+    ]
+    assert statements[:5] == expected
+    insert_index = next(i for i, sql in enumerate(statements) if sql.startswith("INSERT"))
+    assert statements[insert_index - 5:insert_index] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["append", "list_entries"])
+@pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("setting, actual, expected", [
+    ("journal_mode", "delete", "wal"), ("synchronous", 1, 2)
+])
+async def test_journal_rejects_bad_pragma_before_read_or_write(
+    tmp_path, monkeypatch, operation, ready, setting, actual, expected
+):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    real_connect = sqlite3.connect
+    await store.setup()
+    store._ready = ready
+
+    class WrongPragmaConnection:
+        row_factory = None
+        closed = False
+
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, sql):
+            self.statements.append(sql)
+            assert sql.startswith("PRAGMA ")
+            values = {"PRAGMA journal_mode": "wal", "PRAGMA synchronous": 2}
+            value = actual if sql == f"PRAGMA {setting}" else values.get(sql)
+            return SimpleNamespace(fetchone=lambda: (value,))
+
+        def close(self):
+            self.closed = True
+
+    connection = WrongPragmaConnection()
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: connection)
+    scope = ContextScope("session", "run", "agent")
+    with pytest.raises(context.JournalStoreError) as caught:
+        if operation == "append":
+            await store.append(JournalEntry(scope, "turn"))
+        else:
+            await store.list_entries(scope)
+    assert issubclass(context.JournalStoreError, RuntimeError)
+    assert setting in str(caught.value)
+    assert repr(expected) in str(caught.value)
+    assert repr(actual) in str(caught.value)
+    assert connection.closed
+    assert f"PRAGMA {setting}={'WAL' if setting == 'journal_mode' else 'FULL'}" in connection.statements
+    assert connection.statements[-1] == f"PRAGMA {setting}"
+    with real_connect(store.path) as database:
+        assert database.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_blobs", [False, True])
+async def test_journal_identical_retry_returns_original_record(tmp_path, with_blobs):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    blobs = {
+        "a": BlobRef("a" * 64, 3, "text/plain"),
+        "b": BlobRef("b" * 64, 4),
+    } if with_blobs else {}
+    entry = JournalEntry(
+        ContextScope("session", "run", "agent"), "turn",
+        payload={"b": [1, 2], "a": {"x": 1, "y": 2}}, blobs=blobs,
+    )
+    first = await store.append(entry)
+    retry = replace(
+        entry, sequence=12345, created_at=entry.created_at + timedelta(days=1),
+        payload={"a": {"y": 2, "x": 1}, "b": (1, 2)},
+        blobs=dict(reversed(list(blobs.items()))),
+    )
+    assert await store.append(retry) == first
+    assert await store.list_entries(entry.scope) == [first]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM context_journal_blobs").fetchone()[0] == len(blobs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [
+    "session_id", "run_id", "agent_id", "kind", "payload",
+    "blob_name", "blob_digest", "blob_size", "blob_media_type",
+])
+async def test_journal_conflicting_retry_preserves_original(tmp_path, changed):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    entry = JournalEntry(
+        ContextScope("session", "run", "agent"), "turn", payload={"value": 1},
+        blobs={"report": BlobRef("a" * 64, 3, "text/plain")},
+    )
+    first = await store.append(entry)
+    if changed in {"session_id", "run_id", "agent_id"}:
+        retry = replace(entry, scope=replace(entry.scope, **{changed: "different"}))
+    elif changed == "kind":
+        retry = replace(entry, kind="other")
+    elif changed == "payload":
+        retry = replace(entry, payload={"value": 2})
+    elif changed == "blob_name":
+        retry = replace(entry, blobs={"other": entry.blobs["report"]})
+    else:
+        attribute, value = {
+            "blob_digest": ("digest", "b" * 64),
+            "blob_size": ("size", 4),
+            "blob_media_type": ("media_type", "application/json"),
+        }[changed]
+        retry = replace(entry, blobs={"report": replace(entry.blobs["report"], **{attribute: value})})
+    with pytest.raises(context.JournalConflictError) as caught:
+        await store.append(retry)
+    assert isinstance(caught.value, sqlite3.IntegrityError)
+    assert await store.list_entries(entry.scope) == [first]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 1
+        assert connection.execute("SELECT digest FROM context_journal_blobs").fetchall() == [("a" * 64,)]
+
+
+@pytest.mark.asyncio
+async def test_journal_duplicate_blob_digest_keeps_original_integrity_error(tmp_path):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    ref = BlobRef("a" * 64, 3)
+    entry = JournalEntry(ContextScope("session", "run"), "turn", blobs={"a": ref, "b": ref})
+    with pytest.raises(sqlite3.IntegrityError, match="context_journal_blobs") as caught:
+        await store.append(entry)
+    assert type(caught.value) is sqlite3.IntegrityError
+    assert await store.list_entries(entry.scope) == []
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM context_journal_blobs").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_journal_missing_duplicate_row_reraises_original_error(tmp_path, monkeypatch):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    await store.setup()
+    error = sqlite3.IntegrityError("UNIQUE constraint failed: context_journal.entry_id")
+    operations = []
+
+    class MissingRowConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            if sql.startswith("INSERT"):
+                operations.append("insert")
+                raise error
+            assert sql == "SELECT * FROM context_journal WHERE entry_id = ?"
+            assert params == ("missing",)
+            operations.append("select")
+            return SimpleNamespace(fetchone=lambda: None)
+
+        def rollback(self):
+            operations.append("rollback")
+
+    monkeypatch.setattr(store, "_connect", MissingRowConnection)
+    with pytest.raises(sqlite3.IntegrityError) as caught:
+        await store.append(JournalEntry(ContextScope("session", "run"), "turn", entry_id="missing"))
+    assert caught.value is error
+    assert operations == ["insert", "rollback", "select"]
+
+
+@pytest.mark.asyncio
+async def test_journal_concurrent_identical_appends_return_one_record(tmp_path):
+    store = SQLiteJournalStore(tmp_path / "journal.db")
+    await store.setup()
+    entry = JournalEntry(
+        ContextScope("session", "run", "agent"), "turn", payload={"value": 1},
+        blobs={"report": BlobRef("a" * 64, 3)},
+    )
+    retry = replace(entry, created_at=entry.created_at + timedelta(days=1))
+    barrier = threading.Barrier(2, timeout=5)
+
+    def append_in_thread(candidate):
+        barrier.wait()
+        return asyncio.run(store.append(candidate))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(append_in_thread, entry)
+        second = executor.submit(append_in_thread, retry)
+        results = [first.result(timeout=10), second.result(timeout=10)]
+    assert results[0] == results[1]
+    assert results[0].sequence > 0
+    assert results[0].created_at in {entry.created_at, retry.created_at}
+    assert await store.list_entries(entry.scope) == [results[0]]
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM context_journal").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM context_journal_blobs").fetchone()[0] == 1

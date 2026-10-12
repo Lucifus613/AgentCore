@@ -37,6 +37,14 @@ ON context_journal_blobs(digest);
 """
 
 
+class JournalStoreError(RuntimeError):
+    """A journal connection cannot provide the required durability settings."""
+
+
+class JournalConflictError(sqlite3.IntegrityError):
+    """An entry ID is already stored with different content."""
+
+
 class SQLiteJournalStore:
     """Concurrent-safe SQLite journal using one short connection per operation."""
 
@@ -49,7 +57,17 @@ class SQLiteJournalStore:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
+        for pragma, value, expected in (
+            ("journal_mode", "WAL", "wal"),
+            ("synchronous", "FULL", 2),
+        ):
+            connection.execute(f"PRAGMA {pragma}={value}")
+            actual = connection.execute(f"PRAGMA {pragma}").fetchone()[0]
+            if actual != expected:
+                connection.close()
+                raise JournalStoreError(
+                    f"PRAGMA {pragma}: expected {expected!r}, got {actual!r}"
+                )
         return connection
 
     async def setup(self) -> None:
@@ -68,18 +86,10 @@ class SQLiteJournalStore:
 
     async def append(self, entry: JournalEntry) -> JournalEntry:
         await self.setup()
-        sequence = await asyncio.to_thread(self._append_sync, entry)
-        return JournalEntry(
-            scope=entry.scope,
-            kind=entry.kind,
-            payload=dict(entry.payload),
-            blobs=dict(entry.blobs),
-            entry_id=entry.entry_id,
-            sequence=sequence,
-            created_at=entry.created_at,
-        )
+        return await asyncio.to_thread(self._append_sync, entry)
 
-    def _append_sync(self, entry: JournalEntry) -> int:
+    def _append_sync(self, entry: JournalEntry) -> JournalEntry:
+        payload_json = json.dumps(entry.payload, sort_keys=True, separators=(",", ":"))
         blobs_json = json.dumps(
             {
                 name: {
@@ -93,21 +103,40 @@ class SQLiteJournalStore:
             separators=(",", ":"),
         )
         with self._connect() as connection:
-            cursor = connection.execute(
-                """INSERT INTO context_journal
-                (entry_id, session_id, run_id, agent_id, kind, payload_json, blobs_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    entry.entry_id,
-                    entry.scope.session_id,
-                    entry.scope.run_id,
-                    entry.scope.agent_id,
-                    entry.kind,
-                    json.dumps(entry.payload, sort_keys=True, separators=(",", ":")),
-                    blobs_json,
-                    entry.created_at.isoformat(),
-                ),
+            content = (
+                entry.scope.session_id,
+                entry.scope.run_id,
+                entry.scope.agent_id,
+                entry.kind,
+                payload_json,
+                blobs_json,
             )
+            try:
+                cursor = connection.execute(
+                    """INSERT INTO context_journal
+                    (entry_id, session_id, run_id, agent_id, kind, payload_json, blobs_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (entry.entry_id, *content, entry.created_at.isoformat()),
+                )
+            except sqlite3.IntegrityError as error:
+                if str(error) != "UNIQUE constraint failed: context_journal.entry_id":
+                    raise
+                connection.rollback()
+                row = connection.execute(
+                    "SELECT * FROM context_journal WHERE entry_id = ?", (entry.entry_id,)
+                ).fetchone()
+                if row is None:
+                    raise
+                stored_content = tuple(
+                    row[key] for key in (
+                        "session_id", "run_id", "agent_id", "kind", "payload_json", "blobs_json"
+                    )
+                )
+                if stored_content != content:
+                    raise JournalConflictError(
+                        f"journal entry conflict for entry_id {entry.entry_id!r}"
+                    ) from error
+                return self._decode(row)
             connection.executemany(
                 "INSERT INTO context_journal_blobs(entry_id, digest) VALUES (?, ?)",
                 ((entry.entry_id, ref.digest) for ref in entry.blobs.values()),
@@ -115,7 +144,15 @@ class SQLiteJournalStore:
             sequence = cursor.lastrowid
         if sequence is None:
             raise RuntimeError("SQLite did not assign a journal sequence")
-        return int(sequence)
+        return JournalEntry(
+            scope=entry.scope,
+            kind=entry.kind,
+            payload=dict(entry.payload),
+            blobs=dict(entry.blobs),
+            entry_id=entry.entry_id,
+            sequence=int(sequence),
+            created_at=entry.created_at,
+        )
 
     async def list_entries(
         self,
@@ -206,4 +243,4 @@ class SQLiteJournalStore:
         return unreferenced
 
 
-__all__ = ["SQLiteJournalStore"]
+__all__ = ["JournalConflictError", "JournalStoreError", "SQLiteJournalStore"]
