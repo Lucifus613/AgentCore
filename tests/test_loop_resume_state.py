@@ -8,6 +8,12 @@ import pytest
 
 import agent_core.runtime.loop as loop_api
 import agent_core.runtime.loop.agent_loop as kernel
+from agent_core.execution_context import (
+    ExecutionScope,
+    get_current_execution_scope,
+    reset_current_execution_scope,
+    set_current_execution_scope,
+)
 from agent_core.llm import LLMResponse
 from agent_core.loop_types import Intervention, LoopConfig, LoopPolicy, ToolCallIntervention
 from agent_core.messages import assistant_msg, system_msg, tool_msg, user_msg
@@ -846,3 +852,132 @@ async def test_handoffs_guarantee_critical_metadata_only():
     assert snapshots[1][1].metadata["critical_value"] == "ready"
     assert all("background_value" not in s.metadata for _, s in snapshots)
     assert result.metadata["background_value"] == "late"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", [1, 2, 3], ids=["turn1", "turn2", "turn3"])
+@pytest.mark.parametrize("stale_turn", [None, 99], ids=["fresh_scope", "stale_scope"])
+async def test_pending_scope_turn_matches_continuous_run(boundary, stale_turn):
+    class ScopeTool(EchoTool):
+        def __init__(self):
+            super().__init__()
+            self.turns = []
+
+        async def ainvoke(self, args):
+            scope = get_current_execution_scope()
+            turn = scope.metadata.get("current_turn")
+            self.turns.append(turn)
+            value = await super().ainvoke(args)
+            return f"{value}@{turn}"
+
+    def runtime(resolved):
+        def enter(cfg, phase_id, metadata):
+            scope = ExecutionScope(task_id=cfg.task_id, phase_id=phase_id,
+                                   role_id=cfg.role_id, metadata=metadata)
+            return scope, set_current_execution_scope(scope)
+
+        def resolve(_cfg, _metadata, turn):
+            scope = get_current_execution_scope()
+            resolved.append((turn, scope.metadata.get("current_turn")))
+
+        return AgentLoopHooks(enter_scope=enter, exit_scope=reset_current_execution_scope,
+                              resolve_turn_tools=resolve)
+
+    responses = [tool_response("one", "a"), tool_response("two", "b"),
+                 tool_response("three", "c"), LLMResponse(content="done")]
+    control_model, control_tool, control_resolved = ScriptLLM(responses), ScopeTool(), []
+    control_handoffs = []
+
+    async def capture(phase, snapshot, _messages):
+        if phase == "tools":
+            scope = get_current_execution_scope()
+            control_handoffs.append((snapshot.turn, scope.metadata.get("current_turn")))
+
+    control = await run(control_model, tool=control_tool,
+                        runtime_hooks=runtime(control_resolved), on_loop_state=capture)
+    assert control_tool.turns == [1, 2, 3]
+    assert control_resolved == [(1, 1), (2, 2), (3, 3), (4, 4)]
+    assert control_handoffs == [(1, 1), (2, 2), (3, 3)]
+
+    prefix_model, prefix_tool, saved = ScriptLLM(responses), ScopeTool(), []
+
+    async def interrupt(phase, snapshot, messages):
+        if phase == "tools" and snapshot.turn == boundary:
+            saved.append((snapshot, deepcopy(messages)))
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await run(prefix_model, tool=prefix_tool, runtime_hooks=runtime([]),
+                  on_loop_state=interrupt)
+    snapshot, history = saved[0]
+    resumed_model = ScriptLLM(responses[boundary:])
+    resumed_tool, resolved, handoffs = ScopeTool(), [], []
+
+    async def resumed_capture(phase, snapshot, _messages):
+        if phase == "tools":
+            scope = get_current_execution_scope()
+            handoffs.append((snapshot.turn, scope.metadata.get("current_turn")))
+
+    scope_metadata = {} if stale_turn is None else {"current_turn": stale_turn}
+    result = await run(resumed_model, tool=resumed_tool, history=history,
+                       resume_state=snapshot, runtime_hooks=runtime(resolved),
+                       on_loop_state=resumed_capture, scope_metadata=scope_metadata)
+    assert resolved == control_resolved[boundary - 1:]
+    assert handoffs == control_handoffs[boundary - 1:]
+    assert prefix_tool.turns + resumed_tool.turns == control_tool.turns
+    assert prefix_tool.executed + resumed_tool.executed == control_tool.executed
+    assert prefix_model.requests + resumed_model.requests == control_model.requests
+    assert [m for m in result.messages if m["role"] == "tool"] == [
+        m for m in control.messages if m["role"] == "tool"
+    ]
+    assert result.messages == control.messages and summary(result) == summary(control)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_retries,used,turn,requests,surfaces", [
+    (2, None, 0, 1, True),
+    (2, 0, 0, 1, True),
+    (2, 1, 0, 1, True),
+    (2, 2, 0, 0, False),
+    (2, 3, 0, 0, False),
+    (0, None, 0, 0, True),
+    (0, 0, 0, 0, True),
+    (0, 1, 0, 0, False),
+    (1, 1, 0, 0, False),
+    (2, 2, 1, 0, False),
+    (2, 3, 2, 0, False),
+], ids=[
+    "max2_no_resume", "max2_used0", "max2_used1", "max2_used2", "max2_used3",
+    "max0_no_resume", "max0_used0", "max0_used1", "max1_used1",
+    "max2_used2_turn2", "max2_used3_turn3",
+])
+async def test_chain_fallback_respects_restored_attempt_budget(
+    max_retries, used, turn, requests, surfaces,
+):
+    error = RuntimeError("503 overloaded")
+    model, observer = ScriptLLM([error] * 2), CounterObserver()
+    kwargs = {} if used is None else {
+        "resume_state": state(turn=turn, attempts=turn, llm_attempts_used=used),
+    }
+    hooks = AgentLoopHooks(chain_fallback_active=lambda: True)
+    exhausted_error = (
+        f"call_llm exhausted with no captured exception (max_retries=0, turn={turn + 1})"
+    )
+    if surfaces:
+        with pytest.raises(RuntimeError) as caught:
+            await run(model, cfg=config(max_llm_retries=max_retries),
+                      observers=[observer], runtime_hooks=hooks, **kwargs)
+        if requests:
+            assert caught.value is error
+        else:
+            assert str(caught.value) == exhausted_error
+        assert observer.lifecycle == ["start"]
+    else:
+        result = await run(model, cfg=config(max_llm_retries=max_retries),
+                           observers=[observer], runtime_hooks=hooks, **kwargs)
+        assert result.stopped_by == "llm_error"
+        assert result.metadata["llm_error_reason"] == "exhausted"
+        assert result.metadata["llm_error"] == exhausted_error
+        assert observer.lifecycle == ["start", "end"]
+        assert result.turns_used == turn + 1
+    assert len(model.requests) == requests

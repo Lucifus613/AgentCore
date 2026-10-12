@@ -559,6 +559,8 @@ async def _run_loop_inner(
             logger.warning("on_loop_state hook failed at %s turn %d: %s", phase, turn, exc)
 
     if state.pending_tool_calls:
+        if scope is not None:
+            scope.metadata["current_turn"] = turn
         _resolve_turn_tools()
         replay_calls = [dict(call) for call in state.pending_tool_calls]
         last_text = next(
@@ -1017,7 +1019,8 @@ async def _call_llm_with_callbacks(
                 time.perf_counter(), call_id, current_attempt_id,
                 current_attempt_index,
             )
-        if turn == 1 and runtime_hooks.chain_fallback_active():
+        resume_credit_spent = llm_attempts_used > 0 and llm_attempts_used >= cfg.max_llm_retries
+        if turn == 1 and runtime_hooks.chain_fallback_active() and not resume_credit_spent:
             logger.error(
                 "agent_loop: surfacing call_llm failure on turn 1 (reason=%s) so chain wrapper can advance: %s",
                 exhausted.reason, exhausted.last_exc,
