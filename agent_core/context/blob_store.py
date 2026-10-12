@@ -6,10 +6,13 @@ import asyncio
 import hashlib
 import os
 import tempfile
-from contextlib import suppress
 from pathlib import Path
 
 from agent_core.context.models import BlobRef
+
+
+class BlobIntegrityError(ValueError):
+    """Stored blob content does not match its reference."""
 
 
 class FileBlobStore:
@@ -35,29 +38,48 @@ class FileBlobStore:
 
     def _write(self, digest: str, data: bytes) -> None:
         path = self._path(digest)
+        sync_stop = self.root
+        while not sync_stop.exists():
+            sync_stop = sync_stop.parent
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
-            return
-        fd, temporary = tempfile.mkstemp(prefix=".blob-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o444)
-            with suppress(FileExistsError):
-                os.link(temporary, path)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+            self._read_verified(digest, len(data))
+        else:
+            fd, temporary = tempfile.mkstemp(prefix=".blob-", dir=path.parent)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, 0o444)
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    self._read_verified(digest, len(data))
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        directory = path.parent
+        while True:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if directory == sync_stop:
+                break
+            directory = directory.parent
 
     async def get(self, ref: BlobRef) -> bytes:
-        data = await asyncio.to_thread(self._path(ref.digest).read_bytes)
-        if len(data) != ref.size or hashlib.sha256(data).hexdigest() != ref.digest:
-            raise ValueError("blob integrity check failed")
+        return await asyncio.to_thread(self._read_verified, ref.digest, ref.size)
+
+    def _read_verified(self, digest: str, size: int) -> bytes:
+        data = self._path(digest).read_bytes()
+        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+            raise BlobIntegrityError("blob integrity check failed")
         return data
 
     async def delete(self, digest: str) -> None:
         await asyncio.to_thread(self._path(digest).unlink, missing_ok=True)
 
 
-__all__ = ["FileBlobStore"]
+__all__ = ["BlobIntegrityError", "FileBlobStore"]
