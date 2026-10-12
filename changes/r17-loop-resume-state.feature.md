@@ -1,0 +1,1 @@
+Add optional loop resume state and boundary snapshots for counters, metadata, canonical history, and pending tool calls. Resumed runs preserve the first model call's remaining attempt budget and execute pending calls through the existing tool pipeline.

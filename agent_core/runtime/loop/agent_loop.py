@@ -12,7 +12,7 @@ import inspect
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -39,6 +39,7 @@ from agent_core.messages import (
     is_assistant_msg,
     is_tool_msg,
     system_msg,
+    text_of,
     tool_msg,
     user_msg,
 )
@@ -123,6 +124,28 @@ UNVERIFIED_STREAM_PROTOCOLS = frozenset({"responses", "bedrock"})
 TurnCompleteHook = Callable[
     [int, list[Message], dict[str, Any]], Awaitable[None],
 ]
+
+
+@dataclass(frozen=True)
+class LoopResumeState:
+    """Loop control at a boundary; history is supplied via initial_messages.
+
+    Mappings and call dictionaries are shallow snapshots. Only the first LLM
+    call spends ``llm_attempts_used``; pending calls belong to ``turn`` already.
+    """
+
+    turn: int = 0
+    attempts: int = 0
+    total_tool_calls: int = 0
+    no_tool_retries: int = 0
+    truncation_continuations: int = 0
+    truncated_text_parts: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    llm_attempts_used: int = 0
+    pending_tool_calls: tuple[dict[str, Any], ...] = ()
+
+
+LoopStateHook = Callable[[str, LoopResumeState, list[Message]], Awaitable[None]]
 
 # Signature: () -> awaitable bool. Returning ``True`` signals a graceful
 # pause — the loop stops AFTER the current turn's checkpoint has been
@@ -296,12 +319,25 @@ async def run_agent_loop(
     pause_check: PauseCheckHook | None = None,
     scope_metadata: dict[str, Any] | None = None,
     runtime_hooks: AgentLoopHooks | None = None,
+    resume_state: LoopResumeState | None = None,
+    on_loop_state: LoopStateHook | None = None,
 ) -> AgentLoopResult:
     """Run a generic ReAct loop with observer and persistence hooks.
 
     Persistence precedes the pause probe, ensuring a paused run is resumable.
     Hook failures are isolated from the loop.
+
+    Resume counters and metadata with ``resume_state`` and the corresponding
+    ``initial_messages``. ``on_loop_state`` receives shallow snapshots before
+    each iteration ("turn") and tool batch ("tools"); cancellation propagates.
     """
+    if resume_state is not None:
+        for name in (
+            "turn", "attempts", "total_tool_calls", "no_tool_retries",
+            "truncation_continuations", "llm_attempts_used",
+        ):
+            if getattr(resume_state, name) < 0:
+                raise ValueError(f"resume_state.{name} must be nonnegative")
     cfg = config or LoopConfig()
     runtime = runtime_hooks or AgentLoopHooks()
     obs = observers or []
@@ -344,7 +380,8 @@ async def run_agent_loop(
             user_msg(user_message),
         ]
 
-    metadata: dict[str, Any] = {"role_id": cfg.role_id}
+    metadata: dict[str, Any] = dict(resume_state.metadata) if resume_state else {}
+    metadata["role_id"] = cfg.role_id
 
     scope_meta: dict[str, Any] = {"agent_id": cfg.role_id}
     if scope_metadata:
@@ -359,6 +396,7 @@ async def run_agent_loop(
             messages, metadata, on_turn_complete, pause_check,
             scope=scope, runtime_hooks=runtime,
             tool_result_cap=_effective_tool_result_cap(cfg, history_policy),
+            resume_state=resume_state, on_loop_state=on_loop_state,
         )
     except asyncio.CancelledError:
         # The loop task was cancelled mid-flight (wall deadline, fan-out
@@ -430,6 +468,8 @@ async def _run_loop_inner(
     scope: Any = None,
     runtime_hooks: AgentLoopHooks | None = None,
     tool_result_cap: int | None = None,
+    resume_state: LoopResumeState | None = None,
+    on_loop_state: LoopStateHook | None = None,
 ) -> AgentLoopResult:
     """Inner loop extracted so run_agent_loop can wrap with ExecutionScope."""
     runtime = runtime_hooks or AgentLoopHooks()
@@ -437,10 +477,12 @@ async def _run_loop_inner(
     await notify_observers(obs, "on_loop_start", cfg)
 
     stop_reason = ""
-    total_tool_calls = 0
-    no_tool_retries = 0
-    truncation_continuations = 0
-    truncated_text_parts: list[str] = []
+    state = resume_state or LoopResumeState()
+    total_tool_calls = state.total_tool_calls
+    no_tool_retries = state.no_tool_retries
+    truncation_continuations = state.truncation_continuations
+    truncated_text_parts = list(state.truncated_text_parts)
+    llm_attempts_used = state.llm_attempts_used
 
     last_input_tokens = 0
     last_output_tokens = 0
@@ -474,15 +516,11 @@ async def _run_loop_inner(
             )
 
     max_attempts = cfg.max_turns + EXTRA_ATTEMPTS_BUFFER
-    turn = 0
-    attempts = 0
+    turn = state.turn
+    attempts = state.attempts
 
-    while turn < cfg.max_turns and attempts < max_attempts:
-        turn += 1
-        attempts += 1
-        if scope is not None:
-            scope.metadata["current_turn"] = turn
-
+    def _resolve_turn_tools() -> None:
+        nonlocal tool_map, tool_names, llm_with_tools
         # Re-resolve the turn's tools before anything reads them. A product
         # that reconfigures its tool surface mid-run (adds an MCP server,
         # disables a tool) returns the new full set here; the rebind updates
@@ -504,6 +542,67 @@ async def _run_loop_inner(
                     # already honours; only the shown set is narrowed, every
                     # tool stays callable.
                     metadata["_llm_allowed_tools"] = sorted(resolved.visible)
+
+    async def _hand_out(phase: str, calls: Sequence[dict[str, Any]] = ()) -> None:
+        assert on_loop_state is not None
+        snapshot = LoopResumeState(
+            turn=turn, attempts=attempts, total_tool_calls=total_tool_calls,
+            no_tool_retries=no_tool_retries,
+            truncation_continuations=truncation_continuations,
+            truncated_text_parts=tuple(truncated_text_parts),
+            metadata=dict(metadata),
+            pending_tool_calls=tuple(dict(call) for call in calls),
+        )
+        try:
+            await on_loop_state(phase, snapshot, list(messages))
+        except Exception as exc:
+            logger.warning("on_loop_state hook failed at %s turn %d: %s", phase, turn, exc)
+
+    if state.pending_tool_calls:
+        _resolve_turn_tools()
+        replay_calls = [dict(call) for call in state.pending_tool_calls]
+        last_text = next(
+            (text_of(m.get("content")) for m in reversed(messages) if is_assistant_msg(m)), "",
+        )
+        replay_ctx = TurnContext(
+            turn=turn, max_turns=cfg.max_turns, task_id=cfg.task_id, role_id=cfg.role_id,
+            ai_text=last_text, thinking="",
+            tool_calls=replay_calls, messages=messages, usage=None, metadata=metadata,
+        )
+        if on_loop_state is not None:
+            await _hand_out("tools", replay_calls)
+        stop_reason, tool_calls_executed = await _execute_tool_calls(
+            cfg, obs, tool_map, messages, metadata, turn, total_tool_calls,
+            replay_ctx, replay_calls, runtime.tool_execution,
+            runtime.body_has_spill_reference, runtime.render_tool_result,
+            result_max_chars=tool_result_cap, profile=profile,
+            max_images_in_history=policy.max_images_in_history,
+        )
+        total_tool_calls += tool_calls_executed
+        if not stop_reason:
+            stop_reason = await _handle_context_overflow(
+                cfg, obs, messages, metadata, turn, 0, 0,
+                runtime.context_overflow_recovery_note,
+            )
+        if not stop_reason:
+            stop_reason, replay_again = await _handle_turn_end(
+                cfg, obs, messages, metadata, turn, replay_ctx, on_turn_complete, pause_check,
+            )
+            if replay_again:
+                turn -= 1
+        if stop_reason:
+            return await _finalize_loop(
+                obs, messages, metadata, turn, total_tool_calls, stop_reason,
+            )
+
+    while turn < cfg.max_turns and attempts < max_attempts:
+        if on_loop_state is not None:
+            await _hand_out("turn")
+        turn += 1
+        attempts += 1
+        if scope is not None:
+            scope.metadata["current_turn"] = turn
+        _resolve_turn_tools()
 
         (
             llm_for_turn,
@@ -531,8 +630,9 @@ async def _run_loop_inner(
             call_id, current_attempt_id, current_attempt_index
         ) = await _call_llm_with_callbacks(
             cfg, obs, profile, llm_for_turn, messages_for_call, metadata, turn,
-            stream_llm_tokens, runtime
+            stream_llm_tokens, runtime, llm_attempts_used,
         )
+        llm_attempts_used = 0
         if stop_reason:
             break
 
@@ -627,6 +727,8 @@ async def _run_loop_inner(
         truncated_text_parts.clear()
 
         if not skip_tool_execution:
+            if on_loop_state is not None:
+                await _hand_out("tools", parsed_calls)
             stop_reason, tool_calls_executed = await _execute_tool_calls(
                 cfg, obs, tool_map, messages, metadata, turn, total_tool_calls,
                 ctx, parsed_calls, runtime.tool_execution,
@@ -782,18 +884,19 @@ async def _call_llm_with_callbacks(
     cfg: LoopConfig, obs: list, profile: Any, llm_for_turn: Any, messages_for_call: list[Message],
     metadata: dict[str, Any], turn: int, stream_llm_tokens: bool,
     runtime_hooks: AgentLoopHooks,
+    llm_attempts_used: int = 0,
 ) -> tuple[Any, str, float | None, float, float, str, str, int]:
     llm_call_started = time.perf_counter()
     first_delta_at: float | None = None
     call_id = f"llm_{uuid.uuid4().hex}"
-    current_attempt_index = 1
-    current_attempt_id = f"{call_id}_attempt_01"
+    current_attempt_index = llm_attempts_used + 1
+    current_attempt_id = f"{call_id}_attempt_{current_attempt_index:02d}"
 
     metadata["_llm_call_id"] = call_id
     metadata["_llm_attempt_id"] = current_attempt_id
     metadata["_llm_attempt_index"] = current_attempt_index
     metadata["_llm_attempt_outcome"] = ""
-    metadata["_llm_attempt_count"] = 0
+    metadata["_llm_attempt_count"] = llm_attempts_used
     # Middleware proxies resolve their per-call context from the active scope,
     # while observer contexts use the loop-local metadata mapping above. Keep
     # the shared identity keys aligned so host wire-capture hooks can join the
@@ -826,7 +929,7 @@ async def _call_llm_with_callbacks(
 
     async def _on_attempt(event: dict[str, Any]) -> None:
         nonlocal current_attempt_id, current_attempt_index
-        current_attempt_index = int(event.get("attempt_index", 1) or 1)
+        current_attempt_index = int(event.get("attempt_index", 1) or 1) + llm_attempts_used
         current_attempt_id = f"{call_id}_attempt_{current_attempt_index:02d}"
         phase = str(event.get("phase", "") or "")
         outcome = str(event.get("outcome", "") or "")
@@ -886,7 +989,8 @@ async def _call_llm_with_callbacks(
 
     try:
         response = await call_llm(
-            llm_for_turn, messages_for_call, cfg.llm_timeout, cfg.max_llm_retries, turn,
+            llm_for_turn, messages_for_call, cfg.llm_timeout,
+            max(0, cfg.max_llm_retries - llm_attempts_used), turn,
             on_delta=_on_delta if stream_llm_tokens else None,
             retry_wait_fixed=cfg.retry_wait_fixed,
             runaway_state=metadata.setdefault(RUNAWAY_STATE_KEY, {}),
