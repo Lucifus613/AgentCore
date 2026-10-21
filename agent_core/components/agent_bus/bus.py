@@ -108,6 +108,7 @@ from agent_core.runtime.loop.agent_loop import run_agent_loop
 from agent_core.runtime.loop.message_trimmer import (
     MessageTrimmer,
     NullTrimmer,
+    TaskBoundary,
     find_final_assistant,
     trim_and_remap_boundaries,
 )
@@ -717,6 +718,12 @@ class AgentBus:
         self._counter += 1
         return f"{parent_task_id}.job.{self._counter}"
 
+    def advance_job_counter(self, value: int) -> None:
+        """Raise the global job-id counter to at least ``value``; never lower it."""
+        if value < 0:
+            raise ValueError("job counter must be nonnegative")
+        self._counter = max(self._counter, value)
+
     def reserve_session_job_id(self, session_id: str) -> str:
         """Reserve the real job id before an external authorization commits.
 
@@ -842,9 +849,23 @@ class AgentBus:
 
                 sub_observers = _with_wall_clock_guard(sub_observers, guard)
 
+                loop_user_message = item.question
+                resume_kwargs: dict[str, Any] = {}
+                if runtime.loop_resume is not None:
+                    resume = runtime.loop_resume(job_id, item, 0)
+                    if resume is not None:
+                        resume_kwargs = {
+                            "resume_state": resume.resume_state,
+                            "on_loop_state": resume.on_loop_state,
+                        }
+                        if resume.initial_messages is not None:
+                            resume_kwargs["initial_messages"] = resume.initial_messages
+                            loop_user_message = ""
+
                 coro = run_agent_loop(
                     system_prompt=system_prompt,
-                    user_message=item.question,
+                    user_message=loop_user_message,
+                    **resume_kwargs,
                     llm=sub_llm,
                     tools=sub_tools,
                     config=sub_config,
@@ -1351,6 +1372,83 @@ class AgentBus:
         )
         return session_id
 
+    async def restore_session(
+        self,
+        *,
+        task_id: str,
+        name: str,
+        role_id: str,
+        system_prompt: str,
+        tools: list[Tool],
+        llm: Any,
+        trimmer: MessageTrimmer | None = None,
+        messages: list[Message] | None = None,
+        task_boundaries: list[TaskBoundary] | list[list[int | None]] | None = None,
+        total_task_count: int = 0,
+        next_task_index: int = 0,
+        last_report: str = "",
+        max_turns: int = 100,
+        tool_result_max_chars: int | None = None,
+        llm_timeout: int | None = None,
+        runtime_spec: SubAgentRuntimeSpec | None = None,
+    ) -> str:
+        """Rebuild an idle session from a record of closed task boundaries.
+
+        Record an interrupted task's session BEFORE opening its boundary:
+        messages, boundaries and total_task_count must exclude that task.
+        Resubmission opens its boundary and adds its prompt/count normally;
+        loop_resume supplies its interrupted turns separately. This also works
+        with eager-trimmed history. Runtime queues and activity are not restored.
+        An existing session id or an open/out-of-range boundary is rejected.
+        """
+        session_id = self._make_session_id(task_id, name)
+        if session_id in self._sessions:
+            raise ValueError(f"session {session_id!r} already exists")
+        history = list(messages or [])
+        boundaries: list[TaskBoundary] = []
+        for start, end in task_boundaries or []:
+            if end is None or start is None or not 0 <= start <= end < len(history):
+                raise ValueError("restored task boundaries must be closed and in range")
+            boundaries.append((start, end))
+
+        session = SubAgentSession(
+            session_id=session_id,
+            task_id=task_id,
+            name=name,
+            role_id=role_id,
+            system_prompt=system_prompt,
+            tools=list(tools),
+            llm=llm,
+            trimmer=trimmer or NullTrimmer(),
+            messages=history,
+            task_boundaries=boundaries,
+            total_task_count=total_task_count,
+            next_task_index=next_task_index,
+            last_report=last_report,
+            max_turns=max_turns,
+            tool_result_max_chars=tool_result_max_chars,
+            llm_timeout=llm_timeout,
+            runtime_spec=runtime_spec,
+        )
+        self._sessions[session_id] = session
+        event_store = self._event_sink()
+        if event_store is not None:
+            await event_store.append(
+                task_id=task_id,
+                event_type=EventType.AGENT_ACTION,
+                payload={
+                    "trace_type": "session_restored",
+                    "session_id": session_id,
+                    "name": name,
+                    "role_id": role_id,
+                    "agent": name,
+                    "action": "session_restored",
+                    "detail": f"Restored sub-agent '{name}' (role={role_id})",
+                },
+                agent_role="system",
+            )
+        return session_id
+
     async def submit_task_to_session(
         self,
         session_id: str,
@@ -1633,10 +1731,35 @@ class AgentBus:
                     loop_observers.append(_SessionActivityObserver(session))
                 loop_observers = _with_wall_clock_guard(loop_observers, guard)
 
+                loop_user_message = task_prompt
+                loop_initial = initial_messages
+                resume_kwargs: dict[str, Any] = {}
+                if active_runtime.loop_resume is not None:
+                    resume = active_runtime.loop_resume(
+                        job_id, session_item, pending.task_index,
+                    )
+                    if resume is not None:
+                        resume_kwargs = {
+                            "resume_state": resume.resume_state,
+                            "on_loop_state": resume.on_loop_state,
+                        }
+                        if resume.initial_messages is not None:
+                            if (
+                                resume.prefix_count != prefix_count
+                                or len(resume.initial_messages) < prefix_count
+                            ):
+                                raise ValueError(
+                                    "loop_resume requires the session prefix count "
+                                    "and at least that many replacement messages"
+                                )
+                            loop_initial = resume.initial_messages
+                            loop_user_message = ""
+
                 coro = run_agent_loop(
                     system_prompt=session.system_prompt,
-                    user_message=task_prompt,
-                    initial_messages=initial_messages,
+                    user_message=loop_user_message,
+                    initial_messages=loop_initial,
+                    **resume_kwargs,
                     llm=session.llm,
                     tools=session.tools,
                     config=loop_config,
