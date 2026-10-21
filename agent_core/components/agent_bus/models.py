@@ -12,11 +12,14 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from agent_core.messages import Message
 from agent_core.runtime.loop.message_trimmer import MessageTrimmer, TaskBoundary
 from agent_core.tool import Tool
+
+if TYPE_CHECKING:
+    from agent_core.runtime.loop.agent_loop import LoopResumeState, LoopStateHook
 
 
 class DepthLimitExceeded(RuntimeError):
@@ -212,6 +215,24 @@ class SubAgentRuntimeSpec:
     # (rw)) is scoped to that sub-agent and reset on exit. ``None`` → no
     # wrapping (agent_team leases its sandbox through its own mechanism).
     context_setup: Callable[[str, SubTask], Any] | None = None
+    # Called before loop entry with the submit ordinal (0 for one-shot jobs).
+    # None, including a None return, preserves the original loop arguments.
+    loop_resume: Callable[[str, SubTask, int], LoopResume | None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LoopResume:
+    """Loop entry overrides supplied by ``SubAgentRuntimeSpec.loop_resume``.
+
+    Replacement messages include the task prompt and any interrupted turns.
+    Session prefixes are checked by count, not content: compaction may rewrite
+    or reorder them. ``prefix_count`` is the recorded first turn's prefix size.
+    """
+
+    resume_state: LoopResumeState | None = None
+    on_loop_state: LoopStateHook | None = None
+    initial_messages: list[Message] | None = None
+    prefix_count: int | None = None
 
 
 @dataclass
