@@ -1671,11 +1671,8 @@ class AgentBus:
         )
 
         # Snapshot for _run closure so later mutations don't leak.
-        # ``run_agent_loop`` only appends a HumanMessage when ``user_message``
-        # is non-empty (resume path re-enters with ``user_message=""``). We
-        # always pass ``task_prompt`` here which is non-empty by contract,
-        # but the explicit branch keeps the accounting correct if a future
-        # caller ever invokes this path with an empty prompt.
+        # Session prefix after opening the boundary: initial messages plus task prompt.
+        # Unchanged when resume clears ``user_message`` after prefix-count validation.
         prefix_count = len(initial_messages) + (1 if task_prompt else 0)
 
         async def _run() -> SubAgentResult:
